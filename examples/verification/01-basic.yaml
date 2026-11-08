@@ -1,0 +1,28 @@
+# 最小路径：2 个 worker、无 GPU、正常退出。
+# 期望：Queued → Starting → Running → Succeeded，billedSeconds > 0，
+# 两个 worker 分别拿到 NODE_RANK 0/1。
+apiVersion: trainpilot.wutz.dev/v1alpha1
+kind: TrainTask
+metadata:
+  name: verify-basic
+spec:
+  description: 两 worker 打印 rank，正常退出
+  image: busybox:1.36
+  command:
+    - |
+      set -eu
+      echo "node_rank=${NODE_RANK} nnodes=${NNODES} master=${MASTER_ADDR}:${MASTER_PORT} run=${RUN_ID} restart=${RESTART_COUNT}"
+      if [ "${NODE_RANK}" = "1" ]; then
+        echo "worker 1 waits for worker 0 to finish"
+        sleep 5
+      fi
+      echo done
+  workers: 2
+  resources:
+    cpu: "1"
+    memory: 1Gi
+  pricePerWorkerHour: "2.00"
+  faultTolerance:
+    autoRestart: true
+    maxRestarts: 3
+    maxRuntimeSeconds: 900

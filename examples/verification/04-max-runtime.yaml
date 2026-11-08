@@ -1,0 +1,21 @@
+# 最长运行时长：任务一直在跑，maxRuntimeSeconds=120。
+# 期望：约 2 分钟后 Phase=Failed、Reason=MaxRuntimeExceeded，worker 被回收，
+# billedSeconds ≥ 120，计费按段落结算。
+apiVersion: trainpilot.wutz.dev/v1alpha1
+kind: TrainTask
+metadata:
+  name: verify-max-runtime
+spec:
+  description: 运行超过最长时长后终止
+  image: busybox:1.36
+  command:
+    - echo "start"; sleep 600
+  workers: 1
+  resources:
+    cpu: "1"
+    memory: 1Gi
+  pricePerWorkerHour: "1.00"
+  faultTolerance:
+    autoRestart: true
+    maxRestarts: 3
+    maxRuntimeSeconds: 120

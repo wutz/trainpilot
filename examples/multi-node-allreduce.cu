@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <cuda_runtime.h>
 #include <nccl.h>
+#include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
