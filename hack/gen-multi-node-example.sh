@@ -38,8 +38,10 @@ cat "$tmp" >>"$out"
 
 cat >>"$out" <<'YAML'
       CU
-      nvcc -O2 -o /tmp/allreduce /tmp/allreduce.cu -lnccl
-      NODE_RANK="${NODE_RANK:-0}" GPUS_PER_NODE="${PET_NPROC_PER_NODE:-8}" /tmp/allreduce
+      nvcc -O2 -Xcompiler -pthread -o /tmp/allreduce /tmp/allreduce.cu -lnccl
+      # No numeric fallback here: Trainer sets PET_NPROC_PER_NODE=auto, and the
+      # program itself clamps to the GPUs actually visible in the container.
+      NODE_RANK="${NODE_RANK:-0}" GPUS_PER_NODE="${PET_NPROC_PER_NODE}" /tmp/allreduce
   workers: 2
   gpuType: rtx-5090
   resources:
