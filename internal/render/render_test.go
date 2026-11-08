@@ -201,16 +201,25 @@ func TestStorageMounts(t *testing.T) {
 	}
 }
 
-func TestCommandRunsThroughBashLC(t *testing.T) {
+// The worker entry point must be /bin/sh: images such as busybox ship no bash,
+// and a missing interpreter fails the container at start, not at admission.
+func TestCommandEntryPointIsPOSIXShell(t *testing.T) {
 	tk := task(1, 1)
 	tk.Spec.Command = []string{"echo a", "echo b"}
 	pod := WorkerPodSpec(tk, Round{RunID: 1, Round: 1}, Options{})
 	c := pod.Containers[0]
-	if len(c.Command) != 3 || c.Command[0] != "bash" || c.Command[1] != "-lc" {
+	if len(c.Command) != 4 || c.Command[0] != "/bin/sh" || c.Command[1] != "-c" {
 		t.Fatalf("command = %v", c.Command)
 	}
-	if c.Command[2] != "echo a\necho b" {
-		t.Fatalf("script = %q", c.Command[2])
+	// The script rides in as $0 so the wrapper is fixed text.
+	if c.Command[3] != "echo a\necho b" {
+		t.Fatalf("script = %q", c.Command[3])
+	}
+	if !strings.Contains(c.Command[2], `exec bash -lc "$0"`) {
+		t.Fatalf("bash is not preferred when present: %q", c.Command[2])
+	}
+	if !strings.Contains(c.Command[2], `exec sh -c "$0"`) {
+		t.Fatalf("sh fallback missing: %q", c.Command[2])
 	}
 }
 

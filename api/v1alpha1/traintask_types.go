@@ -191,8 +191,11 @@ type TrainTaskSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Image string `json:"image"`
 
-	// Command is the startup command. It is executed as `bash -c <command>`.
-	// Exit code 0 means success, anything else means failure (PRD 7.10).
+	// Command is the startup command. The lines are joined and run by the
+	// image's POSIX shell (`/bin/sh -c`), which re-executes it under `bash -lc`
+	// when the image provides bash. Images without any shell (distroless) are
+	// not supported. Exit code 0 means success, anything else means failure
+	// (PRD 7.10).
 	// +kubebuilder:validation:MinItems=1
 	Command []string `json:"command"`
 
