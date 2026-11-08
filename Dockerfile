@@ -30,4 +30,9 @@ WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532
 
+# Links the GHCR package to its repository; without it the package has no
+# repository association and GitHub refuses to change its visibility.
+LABEL org.opencontainers.image.source="https://github.com/wutz/trainpilot"
+LABEL org.opencontainers.image.description="TrainPilot Kubernetes operator for GPU training tasks on Kubeflow Trainer v2"
+
 ENTRYPOINT ["/manager"]
