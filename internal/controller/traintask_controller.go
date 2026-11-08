@@ -332,6 +332,13 @@ func (r *TrainTaskReconciler) observeRound(ctx context.Context, task *trainpilot
 		if stepFailed := r.detectStartupFailure(ctx, task, pods, now); stepFailed != "" {
 			return r.finishRound(ctx, task, round, now, stepFailed, false)
 		}
+		// A short round can start and finish between two polls, so the phase is
+		// still Starting when the TrainJob turns terminal. Without this the
+		// status would requeue forever and never reach Succeeded or Failed.
+		if done, reason := trainJobOutcome(tj); done {
+			r.openSegmentFromPods(task, pods, now)
+			return r.finishRound(ctx, task, round, now, reason, false)
+		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -352,10 +359,12 @@ func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv
 	round render.Round, now time.Time, reason string, _ bool) (ctrl.Result, error) {
 
 	r.closeSegment(task, now, reason)
-	r.deleteRound(ctx, task, round)
 
 	success := reason == trainpilotv1alpha1.ReasonSucceeded
 	if success {
+		// Keep the finished round and its pods: they are the only record of the
+		// workers' output, and a Succeeded pod holds no resources. Deleting the
+		// task still cascades everything away through the owner reference.
 		task.Status.Phase = trainpilotv1alpha1.PhaseSucceeded
 		task.Status.Reason = reason
 		task.Status.Message = "成功：所有 worker 正常退出"
@@ -363,6 +372,11 @@ func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv
 		r.event(task, corev1.EventTypeNormal, "Succeeded", "all workers exited successfully")
 		return ctrl.Result{}, nil
 	}
+
+	// A round that failed is replaced by the next one, so drop it before the
+	// gang re-queues: leaving it would keep its pods and their GPU/NIC
+	// requests counted against the next round's admission.
+	r.deleteRound(ctx, task, round)
 
 	// Classify: preemption spends the platform budget, everything else the
 	// user-facing restart budget (PRD 7.7.1 / 7.7.2).
@@ -566,6 +580,35 @@ func (r *TrainTaskReconciler) markRunning(task *trainpilotv1alpha1.TrainTask, po
 	})
 	r.setCondition(task, ConditionWorkersReady, metav1.ConditionTrue, "AllRunning", "all workers are running")
 	_ = pods
+}
+
+// openSegmentFromPods bills a round the operator never saw as Running. The
+// segment is backdated to the earliest worker start so a short round still
+// reports its billed time instead of zero.
+func (r *TrainTaskReconciler) openSegmentFromPods(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod, now time.Time) {
+	if task.Status.SegmentStartedAt != nil || len(task.Status.Segments) > 0 {
+		return
+	}
+	start := now
+	for i := range pods {
+		if t := pods[i].Status.StartTime; t != nil && t.Time.Before(start) {
+			start = t.Time
+		}
+	}
+	if start.After(now) {
+		start = now
+	}
+	if task.Status.StartedAt == nil {
+		task.Status.StartedAt = timePtr(start)
+	}
+	task.Status.SegmentStartedAt = timePtr(start)
+	task.Status.Segments = append(task.Status.Segments, trainpilotv1alpha1.RunSegment{
+		RunID:              task.Spec.RunID,
+		Round:              task.Status.Round,
+		StartedAt:          timePtr(start),
+		Workers:            task.Spec.Workers,
+		PricePerWorkerHour: task.Spec.PricePerWorkerHour,
+	})
 }
 
 // updateStartingStep maps pod state onto the PRD's starting sub-steps.

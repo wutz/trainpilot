@@ -123,6 +123,43 @@ func TestCompletedTrainJobSucceeds(t *testing.T) {
 	}
 }
 
+// A round that starts and finishes between two polls is still Starting when the
+// TrainJob completes. It must reach Succeeded rather than requeue forever, and
+// the billed segment must be backdated to the workers' start.
+func TestCompletedTrainJobSucceedsFromStarting(t *testing.T) {
+	tk := task("fast", 2, 0)
+	tk.Status.StartedRound = 2
+	tk.Status.Phase = trainpilotv1alpha1.PhaseStarting
+	tk.Status.Workers = nil
+	started := metav1.NewTime(fixedNow.Add(-90 * time.Second))
+	tk.Status.QueuedSince = &started
+	round := render.Round{RunID: 1, Round: 2}
+
+	tj := &trainerv1alpha1.TrainJob{
+		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, round), Namespace: tk.Namespace},
+		Status: trainerv1alpha1.TrainJobStatus{
+			Conditions: []metav1.Condition{{Type: trainerv1alpha1.TrainJobComplete, Status: metav1.ConditionTrue}},
+		},
+	}
+	pod := workerPod(tk.Name, 2, "gn-a")
+	pod.Status.Phase = corev1.PodSucceeded
+	pod.Status.StartTime = &started
+	r, c := newReconciler(t, tk, tj, pod)
+
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Status.Phase != trainpilotv1alpha1.PhaseSucceeded {
+		t.Fatalf("phase = %q, want Succeeded", got.Status.Phase)
+	}
+	if got.Status.BilledSeconds != 90 {
+		t.Fatalf("billedSeconds = %d, want 90 (backdated to pod start)", got.Status.BilledSeconds)
+	}
+	if got.Status.RestartCount != 0 {
+		t.Fatal("a successful round must not spend restart budget")
+	}
+}
+
 // Billing is measured on segments; exceeding max runtime ends the run.
 func TestMaxRuntimeIsEnforcedOnBilledTime(t *testing.T) {
 	tk := task("long-run", 2, 0)
