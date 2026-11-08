@@ -97,31 +97,31 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 type taskView struct {
-	Name             string   `json:"name"`
-	Namespace        string   `json:"namespace"`
-	Phase            string   `json:"phase"`
-	Message          string   `json:"message"`
-	RunID            int32    `json:"runId"`
-	Round            int32    `json:"round"`
-	RestartCount     int32    `json:"restartCount"`
-	MaxRestarts      int32    `json:"maxRestarts"`
-	PreemptionCount  int32    `json:"preemptionCount"`
-	MaxPreemptions   int32    `json:"maxPreemptions"`
-	Workers          int32    `json:"workers"`
-	ReadyWorkers     int      `json:"readyWorkers"`
-	GPUsPerWorker    int32    `json:"gpusPerWorker"`
-	GPUType          string   `json:"gpuType"`
-	Image            string   `json:"image"`
-	BilledSeconds    int64    `json:"billedSeconds"`
-	AccumulatedCost  string   `json:"accumulatedCost"`
-	PricePerWorker   string   `json:"pricePerWorkerHour"`
-	Nodes            []string `json:"nodes"`
-	ExcludedNodes    []string `json:"excludedNodes"`
-	StartedAt        string   `json:"startedAt,omitempty"`
-	CompletionTime   string   `json:"completionTime,omitempty"`
-	CreatedAt        string   `json:"createdAt"`
-	StartingStep     string   `json:"startingStep,omitempty"`
-	LastSegmentEnd   string   `json:"lastSegmentEndReason,omitempty"`
+	Name            string   `json:"name"`
+	Namespace       string   `json:"namespace"`
+	Phase           string   `json:"phase"`
+	Message         string   `json:"message"`
+	RunID           int32    `json:"runId"`
+	Round           int32    `json:"round"`
+	RestartCount    int32    `json:"restartCount"`
+	MaxRestarts     int32    `json:"maxRestarts"`
+	PreemptionCount int32    `json:"preemptionCount"`
+	MaxPreemptions  int32    `json:"maxPreemptions"`
+	Workers         int32    `json:"workers"`
+	ReadyWorkers    int      `json:"readyWorkers"`
+	GPUsPerWorker   int32    `json:"gpusPerWorker"`
+	GPUType         string   `json:"gpuType"`
+	Image           string   `json:"image"`
+	BilledSeconds   int64    `json:"billedSeconds"`
+	AccumulatedCost string   `json:"accumulatedCost"`
+	PricePerWorker  string   `json:"pricePerWorkerHour"`
+	Nodes           []string `json:"nodes"`
+	ExcludedNodes   []string `json:"excludedNodes"`
+	StartedAt       string   `json:"startedAt,omitempty"`
+	CompletionTime  string   `json:"completionTime,omitempty"`
+	CreatedAt       string   `json:"createdAt"`
+	StartingStep    string   `json:"startingStep,omitempty"`
+	LastSegmentEnd  string   `json:"lastSegmentEndReason,omitempty"`
 }
 
 func writeTasks(w http.ResponseWriter, r *http.Request, c client.Reader) {
