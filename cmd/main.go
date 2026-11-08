@@ -36,6 +36,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+	trainerv1alpha1 "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+
 	trainpilotv1alpha1 "github.com/wutz/trainpilot/api/v1alpha1"
 	"github.com/wutz/trainpilot/internal/controller"
 	"github.com/wutz/trainpilot/internal/ui"
@@ -52,6 +55,9 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(trainpilotv1alpha1.AddToScheme(scheme))
+	// The controller owns and watches objects from both Trainers and JobSets.
+	utilruntime.Must(trainerv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(jobsetv1alpha2.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
