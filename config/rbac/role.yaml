@@ -1,0 +1,78 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - jobset.x-k8s.io
+  resources:
+  - jobsets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - trainer.kubeflow.org
+  resources:
+  - clustertrainingruntimes
+  - trainjobs/status
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - trainer.kubeflow.org
+  resources:
+  - trainingruntimes
+  - trainjobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - trainpilot.wutz.dev
+  resources:
+  - traintasks
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - trainpilot.wutz.dev
+  resources:
+  - traintasks/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - trainpilot.wutz.dev
+  resources:
+  - traintasks/status
+  verbs:
+  - get
+  - patch
+  - update

@@ -1,0 +1,113 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/wutz/trainpilot
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+replicaCount: 2
+
+# Leader election keeps one active reconciler; the dashboard is served by all.
+leaderElection: true
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+
+# Operator-wide render options, mirroring the manager flags.
+controller:
+  # Node label carrying the accelerator type; used for node selection.
+  gpuNodeLabel: scclabs.dev/gpu
+  # Taint keys the worker pods tolerate, comma-separated.
+  gpuTolerationKeys: nvidia.com/gpu,scclabs.dev/vgpu
+  # Fraction of a worker's memory limit mounted as /dev/shm (PRD 7.3.5).
+  sharedMemoryRatio: 0.5
+  # ServiceAccount for worker pods; empty uses the namespace default.
+  workerServiceAccount: ""
+  extraArgs: []
+
+# Read-only dashboard served by the manager itself over plain HTTP.
+ui:
+  enabled: true
+  port: 8082
+
+metrics:
+  enabled: true
+  secure: true
+  port: 8443
+
+webhook:
+  enabled: true
+  # Ignored when the API server cannot reach the webhook: a broken operator
+  # must not be able to block task creation.
+  failurePolicy: Ignore
+  timeoutSeconds: 10
+  port: 9443
+  certDir: /tmp/k8s-webhook-server/serving-certs
+  # The chart issues and rotates the serving certificate with cert-manager.
+  certManager:
+    enabled: true
+    issuerRef:
+      name: selfsigned-cluster-issuer
+      kind: ClusterIssuer
+      # group: cert-manager.io
+
+crds:
+  # Install the TrainTask CRD with the release (upgraded on `helm upgrade`).
+  install: true
+  keep: true
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 10m
+  host: trainpilot.wutz.dev
+  path: /
+  tls:
+    enabled: true
+    secretName: trainpilot-tls
+    # cert-manager issuer for the ingress certificate.
+    issuerRef:
+      name: selfsigned-cluster-issuer
+      kind: ClusterIssuer
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - "ALL"
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 128Mi
+
+# The manager tolerates GPU-node taints so it can run on an accelerated node
+# when the cluster has no control-plane capacity for it.
+nodeSelector: {}
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+affinity: {}
+
+priorityClassName: ""

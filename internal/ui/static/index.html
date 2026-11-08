@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>TrainPilot · 训练任务</title>
+<style>
+  :root {
+    color-scheme: light;
+    --ink: #171717;
+    --body: #4d4d4d;
+    --mute: #8f8f8f;
+    --hairline: #ebebeb;
+    --hairline-soft: #f2f2f2;
+    --canvas: #fafafa;
+    --elevated: #ffffff;
+    --accent: #0070f3;
+    --success: #00a86b;
+    --warning: #f5a623;
+    --danger: #ee0000;
+    --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: Geist, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--canvas);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 40px 24px 80px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 24px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; font-weight: 500;
+    color: var(--mute); letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  h1 { font-size: 32px; font-weight: 600; letter-spacing: -1.28px; margin: 6px 0 0; }
+  .meta { font-family: var(--mono); font-size: 12px; color: var(--mute); }
+  .summary { display: flex; gap: 28px; margin: 28px 0 20px; flex-wrap: wrap; }
+  .stat .k { font-family: var(--mono); font-size: 11px; color: var(--mute); text-transform: uppercase; letter-spacing: 0.06em; }
+  .stat .v { font-family: var(--mono); font-size: 20px; font-weight: 500; margin-top: 2px; }
+  .card {
+    background: var(--elevated);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    font-family: var(--mono); font-size: 11px; font-weight: 500;
+    color: var(--mute); text-transform: uppercase; letter-spacing: 0.06em;
+    text-align: left; padding: 10px 16px; border-bottom: 1px solid var(--hairline);
+    white-space: nowrap; background: var(--elevated);
+  }
+  tbody td { padding: 12px 16px; border-bottom: 1px solid var(--hairline-soft); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #fcfcfc; }
+  .name { font-weight: 500; }
+  .sub { font-family: var(--mono); font-size: 11px; color: var(--mute); margin-top: 2px; }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .right { text-align: right; }
+  .phase { display: inline-flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--mute); flex: none; }
+  .p-Running .dot { background: var(--success); }
+  .p-Starting .dot, .p-Recovering .dot, .p-Queued .dot { background: var(--warning); }
+  .p-Failed .dot, .p-Interrupted .dot { background: var(--danger); }
+  .p-Succeeded .dot { background: var(--success); }
+  .p-Stopped .dot { background: var(--mute); }
+  .msg { color: var(--body); font-size: 12px; max-width: 320px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; color: var(--body);
+    border: 1px solid var(--hairline); border-radius: 4px; padding: 1px 6px; background: var(--canvas);
+  }
+  .chip.bad { color: var(--danger); border-color: #ffd6d6; background: #fff6f6; }
+  .empty { padding: 56px 24px; text-align: center; color: var(--mute); font-family: var(--mono); font-size: 12px; }
+  .err { color: var(--danger); }
+  footer { margin-top: 16px; font-family: var(--mono); font-size: 11px; color: var(--mute); display: flex; justify-content: space-between; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  @media (max-width: 900px) {
+    .hide-sm { display: none; }
+    .wrap { padding: 24px 12px 60px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="eyebrow">trainpilot.wutz.dev</div>
+      <h1>训练任务</h1>
+    </div>
+    <div class="meta" id="updated">—</div>
+  </header>
+
+  <div class="summary" id="summary"></div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>任务</th>
+          <th>状态</th>
+          <th>规模</th>
+          <th class="right">RUN / 轮次</th>
+          <th class="right">重启 / 抢占</th>
+          <th class="hide-sm">节点</th>
+          <th class="right">计费</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="7" class="empty">加载中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <footer>
+    <span>只读视图 · 所有操作走 TrainTask API</span>
+    <span id="count"></span>
+  </footer>
+</div>
+
+<script>
+const PHASE_LABEL = {
+  Queued: "排队中", Starting: "启动中", Running: "运行中", Recovering: "恢复中",
+  Succeeded: "成功", Failed: "失败", Stopped: "已停止", Interrupted: "已中断",
+};
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function duration(sec) {
+  if (!sec) return "0m";
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  const s = sec % 60;
+  return m > 0 ? `${m}m` : `${s}s`;
+}
+
+function render(data) {
+  const tasks = data.tasks || [];
+  const counts = {};
+  for (const t of tasks) counts[t.phase] = (counts[t.phase] || 0) + 1;
+
+  const running = counts.Running || 0;
+  const waiting = (counts.Queued || 0) + (counts.Starting || 0) + (counts.Recovering || 0);
+  const gpus = tasks.filter(t => t.phase === "Running")
+    .reduce((n, t) => n + t.workers * t.gpusPerWorker, 0);
+  const cost = tasks.reduce((n, t) => n + parseFloat(t.accumulatedCost || "0"), 0);
+
+  document.getElementById("summary").innerHTML = [
+    ["运行中", running],
+    ["等待 / 恢复", waiting],
+    ["在用 GPU", gpus],
+    ["累计费用", "¥" + cost.toFixed(2)],
+  ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
+
+  const updated = new Date(data.generatedAt);
+  document.getElementById("updated").textContent = "刷新于 " + updated.toLocaleTimeString("zh-CN");
+  document.getElementById("count").textContent = tasks.length + " 个任务";
+
+  const body = document.getElementById("rows");
+  if (!tasks.length) {
+    body.innerHTML = `<tr><td colspan="7" class="empty">还没有训练任务</td></tr>`;
+    return;
+  }
+
+  body.innerHTML = tasks.map(t => {
+    const phase = t.phase || "Unknown";
+    const label = PHASE_LABEL[phase] || phase;
+    const nodes = (t.nodes || []).map(n => `<span class="chip">${esc(n)}</span>`).join("");
+    const excluded = (t.excludedNodes || []).map(n => `<span class="chip bad">✕ ${esc(n)}</span>`).join("");
+    const step = phase === "Starting" && t.startingStep ? ` · ${esc(t.startingStep)}` : "";
+    return `<tr>
+      <td>
+        <div class="name">${esc(t.name)}</div>
+        <div class="sub">${esc(t.namespace)} · ${esc(t.image.split("/").pop())}</div>
+      </td>
+      <td>
+        <span class="phase p-${esc(phase)}"><span class="dot"></span>${esc(label)}${step}</span>
+        <div class="msg">${esc(t.message || "")}</div>
+      </td>
+      <td class="num">${t.workers} 节点 × ${t.gpusPerWorker} GPU${t.gpuType ? `<div class="sub">${esc(t.gpuType)}</div>` : ""}</td>
+      <td class="num right">run ${t.runId}<div class="sub">第 ${t.round} 轮</div></td>
+      <td class="num right">${t.restartCount}/${t.maxRestarts}<div class="sub">抢占 ${t.preemptionCount}/${t.maxPreemptions}</div></td>
+      <td class="hide-sm"><div class="chips">${nodes}${excluded}</div></td>
+      <td class="num right">¥${esc(t.accumulatedCost)}
+        <div class="sub">${duration(t.billedSeconds)} · ¥${esc(t.pricePerWorkerHour)}/节点·时</div>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/tasks", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    render(await res.json());
+  } catch (e) {
+    document.getElementById("updated").innerHTML = `<span class="err">连接失败: ${esc(e.message)}</span>`;
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

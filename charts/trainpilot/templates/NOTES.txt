@@ -1,0 +1,25 @@
+TrainPilot {{ .Chart.AppVersion }} deployed to namespace {{ .Release.Namespace }}.
+
+Dashboard:
+{{- if and .Values.ingress.enabled .Values.ui.enabled }}
+  https://{{ .Values.ingress.host }}/        (ingress {{ .Values.ingress.className }}, port 7443 on this cluster)
+{{- else if .Values.ui.enabled }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "trainpilot.uiServiceName" . }} 8082:80
+  http://localhost:8082/
+{{- end }}
+
+Create a task:
+
+  kubectl apply -f config/samples/trainpilot_v1alpha1_traintask.yaml
+
+Then watch it:
+
+  kubectl -n <namespace> get traintasks -w
+
+Notes:
+  - Queueing, gang admission and billing are operator-side: nothing else needs
+    Kueue or Volcano installed.
+  - Stop / continue / rerun a task with
+    kubectl annotate traintask <name> trainpilot.wutz.dev/action=stop=$(date +%s)
+    kubectl annotate traintask <name> trainpilot.wutz.dev/action=continue=$(date +%s)
+    kubectl annotate traintask <name> trainpilot.wutz.dev/action=rerun=$(date +%s)

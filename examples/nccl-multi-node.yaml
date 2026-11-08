@@ -1,0 +1,218 @@
+# Two workers x 8 GPUs across two nodes: verifies multi-node rendering
+# (NNODES / NODE_RANK / MASTER_ADDR, hostNetwork, rdma/hca) with a real
+# cross-node NCCL all-reduce. The CUDA source is embedded so the pod needs
+# nothing but the nccl-tests devel image.
+#
+# Regenerate with: make example-multi-node
+apiVersion: trainpilot.wutz.dev/v1alpha1
+kind: TrainTask
+metadata:
+  name: nccl-multi
+  namespace: trainpilot-demo
+spec:
+  description: 双节点 16 卡 NCCL all_reduce（跨节点 RoCE）
+  image: mir.blsc.cn/library/coreweave/nccl-tests:12.9.1-devel-ubuntu22.04-nccl2.27.6-1-7c12c62
+  command:
+    - |
+      set -eux
+      nvidia-smi -L
+      cat >/tmp/allreduce.cu <<'CU'
+        // A self-contained multi-node NCCL all-reduce, used to verify TrainPilot's
+        // multi-node rendering (NNODES / NODE_RANK / MASTER_ADDR, hostNetwork, RDMA).
+        //
+        // It exists because the usual multi-node NCCL test needs MPI plus an SSH mesh,
+        // which would test MPI as much as the operator. Here the rendezvous is a plain
+        // TCP socket to MASTER_ADDR:MASTER_PORT (the same information PyTorch's env://
+        // rendezvous uses), the ncclUniqueId is broadcast through it, and one child
+        // process is forked per GPU on the node.
+        //
+        // This file is embedded verbatim in nccl-multi-node.yaml, which must stay in
+        // sync with it.
+        #include <arpa/inet.h>
+        #include <cuda_runtime.h>
+        #include <nccl.h>
+        #include <netdb.h>
+        #include <netinet/in.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <sys/socket.h>
+        #include <sys/types.h>
+        #include <unistd.h>
+        
+        #define MAX_CONN 256
+        #define MAX_NODES 64
+        
+        static void die(const char *what) {
+          fprintf(stderr, "error: %s\n", what);
+          exit(1);
+        }
+        
+        static void send_all(int fd, const void *buf, size_t len) {
+          const char *p = buf;
+          while (len > 0) {
+            ssize_t n = send(fd, p, len, 0);
+            if (n <= 0) die("send");
+            p += n;
+            len -= (size_t)n;
+          }
+        }
+        
+        static void recv_all(int fd, void *buf, size_t len) {
+          char *p = buf;
+          while (len > 0) {
+            ssize_t n = recv(fd, p, len, 0);
+            if (n <= 0) die("recv");
+            p += n;
+            len -= (size_t)n;
+          }
+        }
+        
+        __global__ void fill(float *v, float x, size_t n) {
+          size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+          if (i < n) v[i] = x;
+        }
+        
+        static void env_int(const char *name, int *out, int fallback) {
+          const char *v = getenv(name);
+          *out = (v && *v) ? atoi(v) : fallback;
+        }
+        
+        int main(void) {
+          int nodes = 1, node_rank = 0, gpus = 1, port = 29500;
+          env_int("NNODES", &nodes, 1);
+          env_int("NODE_RANK", &node_rank, 0);
+          env_int("GPUS_PER_NODE", &gpus, 1);
+          env_int("MASTER_PORT", &port, 29500);
+          const char *master = getenv("MASTER_ADDR");
+          if (!master || !*master) die("MASTER_ADDR is not set");
+        
+          int world = nodes * gpus;
+          if (world > MAX_CONN) die("world size too large");
+        
+          ncclUniqueId id;
+          if (node_rank == 0) {
+            int ls = socket(AF_INET, SOCK_STREAM, 0);
+            if (ls < 0) die("socket");
+            int on = 1;
+            setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof addr);
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons((uint16_t)port);
+            addr.sin_addr.s_addr = INADDR_ANY;
+            if (bind(ls, (struct sockaddr *)&addr, sizeof addr) < 0) die("bind");
+            if (listen(ls, nodes) < 0) die("listen");
+            printf("[rank 0] rendezvous on %s:%d for %d nodes x %d gpus\n", master, port,
+                   nodes, gpus);
+            fflush(stdout);
+            int conns[MAX_NODES];
+            for (int i = 1; i < nodes; i++) {
+              conns[i] = accept(ls, NULL, NULL);
+              if (conns[i] < 0) die("accept");
+              int peer = -1;
+              recv_all(conns[i], &peer, sizeof peer);
+              printf("[rank 0] node %d joined\n", peer);
+              fflush(stdout);
+            }
+            if (ncclGetUniqueId(&id) != ncclSuccess) die("ncclGetUniqueId");
+            for (int i = 1; i < nodes; i++) send_all(conns[i], &id, sizeof id);
+          } else {
+            int fd = -1;
+            for (int attempt = 0; attempt < 120 && fd < 0; attempt++) {
+              fd = socket(AF_INET, SOCK_STREAM, 0);
+              struct sockaddr_in addr;
+              memset(&addr, 0, sizeof addr);
+              addr.sin_family = AF_INET;
+              addr.sin_port = htons((uint16_t)port);
+              struct hostent *h = gethostbyname(master);
+              if (!h) die("resolve MASTER_ADDR");
+              memcpy(&addr.sin_addr, h->h_addr_list[0], sizeof addr.sin_addr);
+              if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) break;
+              close(fd);
+              fd = -1;
+              sleep(1);
+            }
+            if (fd < 0) die("connect to master");
+            send_all(fd, &node_rank, sizeof node_rank);
+            recv_all(fd, &id, sizeof id);
+          }
+        
+          // One child per GPU; the child that breaks out of the loop owns gpu `g`.
+          int g = 0;
+          for (g = 0; g < gpus; g++) {
+            pid_t pid = (g < gpus - 1) ? fork() : 0;
+            if (pid < 0) die("fork");
+            if (pid == 0) break;
+          }
+          int rank = node_rank * gpus + g;
+          if (cudaSetDevice(g) != cudaSuccess) die("cudaSetDevice");
+        
+          ncclComm_t comm;
+          if (ncclCommInitRank(&comm, world, id, rank) != ncclSuccess)
+            die("ncclCommInitRank");
+        
+          const size_t count = 16 * 1024 * 1024;  // 64 MiB of float
+          const int iters = 20;
+          float *buf = NULL;
+          if (cudaMalloc(&buf, count * sizeof(float)) != cudaSuccess) die("cudaMalloc");
+          fill<<<(count + 255) / 256, 256>>>(buf, (float)(rank + 1), count);
+        
+          cudaDeviceSynchronize();
+          if (ncclAllReduce(buf, buf, count, ncclFloat, ncclSum, comm, 0) != ncclSuccess)
+            die("ncclAllReduce warmup");
+          cudaDeviceSynchronize();
+        
+          cudaEvent_t start, stop;
+          cudaEventCreate(&start);
+          cudaEventCreate(&stop);
+          cudaEventRecord(start);
+          for (int i = 0; i < iters; i++) {
+            if (ncclAllReduce(buf, buf, count, ncclFloat, ncclSum, comm, 0) != ncclSuccess)
+              die("ncclAllReduce");
+          }
+          cudaEventRecord(stop);
+          cudaEventSynchronize(stop);
+          float ms = 0;
+          cudaEventElapsedTime(&ms, start, stop);
+        
+          float got = 0;
+          cudaMemcpy(&got, buf, sizeof(float), cudaMemcpyDeviceToHost);
+          double want = (double)world * (world + 1) / 2.0;
+          double per_rank = (double)(count * sizeof(float)) / 1e9;
+        
+          if (rank == 0) {
+            printf("\n# world=%d (%d nodes x %d gpus), 64 MiB float32 sum all-reduce\n",
+                   world, nodes, gpus);
+            printf("# bus bandwidth = %.2f GB/s, algbw = %.2f GB/s, %.3f ms/iter\n",
+                   (2.0 * (world - 1) / world * per_rank) / (ms / 1000.0 / iters),
+                   per_rank / (ms / 1000.0 / iters), ms / iters);
+          }
+          if (fabs((double)got - want) > 1e-3) {
+            fprintf(stderr, "[rank %d] wrong result: got %f want %f\n", rank, got, want);
+            return 1;
+          }
+          if (rank == 0) printf("RESULT: OK (all %d ranks agreed)\n", world);
+        
+          ncclCommDestroy(comm);
+          cudaFree(buf);
+          return 0;
+        }
+      CU
+      nvcc -O2 -o /tmp/allreduce /tmp/allreduce.cu -lnccl
+      NODE_RANK="${NODE_RANK:-0}" GPUS_PER_NODE="${PET_NPROC_PER_NODE:-8}" /tmp/allreduce
+  workers: 2
+  gpuType: rtx-5090
+  resources:
+    gpusPerWorker: 8
+    cpu: "32"
+    memory: 128Gi
+  pricePerWorkerHour: "24.00"
+  faultTolerance:
+    autoRestart: true
+    maxRestarts: 3
+    maxRuntimeSeconds: 3600
+  tolerations:
+    - key: scclabs.dev/vgpu
+      operator: Exists
+      effect: NoSchedule

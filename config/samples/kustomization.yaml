@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- trainpilot_v1alpha1_traintask.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

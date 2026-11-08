@@ -1,0 +1,1062 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+
+	trainerv1alpha1 "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+
+	trainpilotv1alpha1 "github.com/wutz/trainpilot/api/v1alpha1"
+	"github.com/wutz/trainpilot/internal/render"
+)
+
+const (
+	// ConditionQueued reports admission state.
+	ConditionQueued = "Queued"
+	// ConditionWorkersReady reports whether all workers of the round are running.
+	ConditionWorkersReady = "WorkersReady"
+	// ConditionStopped reports the user-requested stop.
+	ConditionStopped = "Stopped"
+
+	// ConditionReasonAdmitted / NotAdmitted qualify ConditionQueued.
+	ConditionReasonAdmitted    = "Admitted"
+	ConditionReasonNotAdmitted = "NotAdmitted"
+
+	// AnnotationAction carries an idempotent user action request
+	// (continue=<id>, rerun=<id>, stop=<id>). The id is compared against
+	// status.lastAction so a repeated request is applied once.
+	AnnotationAction = "trainpilot.wutz.dev/action"
+
+	// AnnotationActionApplied mirrors the last applied action id.
+	AnnotationActionApplied = "trainpilot.wutz.dev/applied-action"
+
+	// roundLabel selects the TrainJob of the current round.
+	roundLabel = "trainpilot.wutz.dev/round"
+
+	// queueRequeue is how often a queued task re-evaluates admission.
+	queueRequeue = 10 * time.Second
+	// runningRequeue is how often a running task refreshes billed seconds.
+	runningRequeue = 30 * time.Second
+	// startupTimeout bounds Starting before the round counts as a failed startup.
+	startupTimeout = 15 * time.Minute
+	// pendingGrace lets freshly created pods settle before they count as failures.
+	pendingGrace = 5 * time.Minute
+
+	// maxExcludedNodes is the PRD 7.7.7 cap on per-run exclusion.
+	maxExcludedNodes = 8
+	// historyRounds is how many finished rounds are retained.
+	historyRounds = 3
+)
+
+// TrainTaskReconciler reconciles a TrainTask object.
+type TrainTaskReconciler struct {
+	client.Client
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+
+	// GPULabel, GPUTolerationKeys, SharedMemoryRatio and ServiceAccountName are
+	// operator-wide render options (flags in main.go).
+	GPULabel           string
+	GPUTolerationKeys  []string
+	SharedMemoryRatio  float64
+	ServiceAccountName string
+
+	// Now is overridable for tests.
+	Now func() time.Time
+}
+
+// +kubebuilder:rbac:groups=trainpilot.wutz.dev,resources=traintasks,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=trainpilot.wutz.dev,resources=traintasks/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=trainpilot.wutz.dev,resources=traintasks/finalizers,verbs=update
+// +kubebuilder:rbac:groups=trainer.kubeflow.org,resources=trainjobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=trainer.kubeflow.org,resources=trainjobs/status,verbs=get;list;watch
+// +kubebuilder:rbac:groups=trainer.kubeflow.org,resources=trainingruntimes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=trainer.kubeflow.org,resources=clustertrainingruntimes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+
+// Reconcile drives one TrainTask through its lifecycle.
+func (r *TrainTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	var task trainpilotv1alpha1.TrainTask
+	if err := r.Get(ctx, req.NamespacedName, &task); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if !task.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+
+	now := r.now()
+	origStatus := task.Status.DeepCopy()
+
+	// Apply a pending user action (continue / rerun) before anything else.
+	// The change lives in spec/metadata, so it must be persisted with Update and
+	// reconciled again — status-only writes would silently drop it.
+	if r.applyAction(&task) {
+		// spec and metadata go through Update, status through the subresource;
+		// continue resets counters, so both writes can be needed at once.
+		if err := r.Update(ctx, &task); err != nil {
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// A continue request resets per-run budgets, which is a status change and is
+	// therefore applied here rather than in applyAction.
+	r.applyStatusAction(&task)
+
+	// A new spec.runID starts a fresh run: counters, exclusions, segments reset.
+	if task.Spec.RunID != task.Status.RunID {
+		if err := r.beginRun(ctx, &task, now); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	result, err := r.reconcile(ctx, &task, now)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !equalStatus(origStatus, &task.Status, now) {
+		if err := r.Status().Update(ctx, &task); err != nil {
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		logger.V(1).Info("status updated", "phase", task.Status.Phase,
+			"run", task.Status.RunID, "round", task.Status.Round)
+	}
+	return result, nil
+}
+
+// reconcile is the phase machine; it mutates task.Status in memory and returns
+// the requeue interval.
+func (r *TrainTaskReconciler) reconcile(ctx context.Context, task *trainpilotv1alpha1.TrainTask, now time.Time) (ctrl.Result, error) {
+	// User stopped: close the segment, drop the round, release everything.
+	if !task.Spec.WantsRunning() {
+		if task.Status.Phase != trainpilotv1alpha1.PhaseStopped {
+			r.stopRound(ctx, task, now, trainpilotv1alpha1.ReasonUserStopped)
+			task.Status.Phase = trainpilotv1alpha1.PhaseStopped
+			task.Status.Reason = trainpilotv1alpha1.ReasonUserStopped
+			task.Status.Message = "已停止：用户停止运行，worker 已释放"
+			task.Status.CompletionTime = timePtr(now)
+			r.setCondition(task, ConditionStopped, metav1.ConditionTrue, "UserStopped", "stopped by the user")
+			r.event(task, corev1.EventTypeNormal, "Stopped", "task stopped by user")
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Terminal states are final until a new RUN_ID or a continue action.
+	if task.Status.Phase.IsTerminal() {
+		return ctrl.Result{}, nil
+	}
+
+	round := render.Round{
+		RunID:         task.Spec.RunID,
+		Round:         max(task.Status.Round, 1),
+		RestartCount:  task.Status.RestartCount,
+		ExcludedNodes: task.Status.ExcludedNodes,
+	}
+	task.Status.Round = round.Round
+	task.Status.RunID = task.Spec.RunID
+
+	// Max runtime is measured on billed time (PRD 7.3.2 / 7.8), not wall clock.
+	r.accrueBilling(task, now)
+	if limit := task.Spec.FaultTolerance.MaxRuntimeSeconds; limit > 0 && task.Status.BilledSeconds >= limit {
+		r.endRun(ctx, task, now, trainpilotv1alpha1.ReasonMaxRuntimeExceeded)
+		return ctrl.Result{}, nil
+	}
+
+	var tj trainerv1alpha1.TrainJob
+	err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: render.Names(task.Name, round)}, &tj)
+	switch {
+	case apierrors.IsNotFound(err):
+		// A round we started whose TrainJob vanished was removed by the platform
+		// (preemption / eviction), not by us: charge the preemption budget.
+		if task.Status.StartedRound == round.Round && round.Round > 0 {
+			// finishRound charges the preemption budget for ReasonPreempted.
+			r.event(task, corev1.EventTypeWarning, "Preempted",
+				fmt.Sprintf("round %d was removed by the platform", round.Round))
+			return r.finishRound(ctx, task, round, now, trainpilotv1alpha1.ReasonPreempted, false)
+		}
+		return r.startOrQueue(ctx, task, round, now)
+	case err != nil:
+		return ctrl.Result{}, err
+	}
+
+	return r.observeRound(ctx, task, &tj, round, now)
+}
+
+// startOrQueue admits the round through the gang queue or leaves the task Queued.
+func (r *TrainTaskReconciler) startOrQueue(ctx context.Context, task *trainpilotv1alpha1.TrainTask, round render.Round, now time.Time) (ctrl.Result, error) {
+	if task.Status.QueuedSince == nil {
+		task.Status.QueuedSince = timePtr(now)
+	}
+
+	// Queue timeout is per wait (PRD 7.7): exceed it and the task is interrupted.
+	// A timeout can also fire mid-restart, when the previous round was already
+	// billed, so close whatever segment is open and drop stale round objects.
+	timeout := time.Duration(task.Spec.FaultTolerance.QueueTimeoutSeconds) * time.Second
+	if timeout > 0 && now.Sub(task.Status.QueuedSince.Time) > timeout {
+		r.stopRound(ctx, task, now, trainpilotv1alpha1.ReasonQueueTimeout)
+		task.Status.Phase = trainpilotv1alpha1.PhaseInterrupted
+		task.Status.Reason = trainpilotv1alpha1.ReasonQueueTimeout
+		task.Status.Message = "已中断：排队超时，未获得资源"
+		task.Status.CompletionTime = timePtr(now)
+		r.setCondition(task, ConditionQueued, metav1.ConditionFalse, trainpilotv1alpha1.ReasonQueueTimeout, "queue timeout")
+		r.event(task, corev1.EventTypeWarning, "QueueTimeout", "task waited longer than the queue timeout")
+		return ctrl.Result{}, nil
+	}
+
+	admitted, reason, err := r.admit(ctx, task)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !admitted {
+		task.Status.Phase = trainpilotv1alpha1.PhaseQueued
+		task.Status.Message = reason
+		r.setCondition(task, ConditionQueued, metav1.ConditionFalse, ConditionReasonNotAdmitted, reason)
+		r.event(task, corev1.EventTypeNormal, "Queued", reason)
+		return ctrl.Result{RequeueAfter: queueRequeue}, nil
+	}
+
+	if err := r.startRound(ctx, task, round); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	task.Status.Phase = trainpilotv1alpha1.PhaseStarting
+	task.Status.StartedRound = round.Round
+	task.Status.StartingStep = trainpilotv1alpha1.StepAllocatingResources
+	task.Status.QueuedSince = nil
+	task.Status.Message = "启动中：资源已分配，正在创建 worker"
+	r.setCondition(task, ConditionQueued, metav1.ConditionTrue, ConditionReasonAdmitted, "admitted")
+	r.event(task, corev1.EventTypeNormal, "Started", fmt.Sprintf("round %d started with %d workers", round.Round, task.Spec.Workers))
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// startRound renders the runtime and TrainJob for the round and creates them.
+func (r *TrainTaskReconciler) startRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask, round render.Round) error {
+	opts := render.Options{
+		GPULabel:           r.GPULabel,
+		GPUTolerationKeys:  r.GPUTolerationKeys,
+		SharedMemoryRatio:  r.SharedMemoryRatio,
+		ServiceAccountName: r.ServiceAccountName,
+	}
+
+	rt := render.TrainingRuntime(task, round, opts)
+	if err := controllerutil.SetControllerReference(task, rt, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.Create(ctx, rt); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create training runtime: %w", err)
+	}
+
+	tj := render.TrainJob(task, round)
+	if err := controllerutil.SetControllerReference(task, tj, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.Create(ctx, tj); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create train job: %w", err)
+	}
+	return nil
+}
+
+// observeRound reads the current round's pods and TrainJob and advances the phase.
+func (r *TrainTaskReconciler) observeRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
+	tj *trainerv1alpha1.TrainJob, round render.Round, now time.Time) (ctrl.Result, error) {
+
+	pods, err := r.roundPods(ctx, task, round)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// PRD 7.4: Starting resolves into Running only when every worker runs.
+	switch task.Status.Phase {
+	case trainpilotv1alpha1.PhaseQueued, "":
+		task.Status.Phase = trainpilotv1alpha1.PhaseStarting
+		task.Status.QueuedSince = nil
+	}
+
+	r.refreshWorkers(task, pods)
+
+	if task.Status.Phase == trainpilotv1alpha1.PhaseStarting || task.Status.Phase == trainpilotv1alpha1.PhaseRecovering {
+		if allRunning(pods, int(task.Spec.Workers)) {
+			r.markRunning(task, pods, now)
+			r.event(task, corev1.EventTypeNormal, "Running", "all workers are running")
+			return ctrl.Result{RequeueAfter: runningRequeue}, nil
+		}
+		r.updateStartingStep(task, pods, now)
+		if stepFailed := r.detectStartupFailure(ctx, task, pods, now); stepFailed != "" {
+			return r.finishRound(ctx, task, round, now, stepFailed, false)
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Running: the TrainJob condition decides the round's outcome.
+	if done, reason := trainJobOutcome(tj); done {
+		return r.finishRound(ctx, task, round, now, reason, false)
+	}
+	if failed := r.detectWorkerFailure(ctx, task, round, pods); failed != "" {
+		return r.finishRound(ctx, task, round, now, failed, false)
+	}
+
+	r.accrueBilling(task, now)
+	return ctrl.Result{RequeueAfter: runningRequeue}, nil
+}
+
+// finishRound closes the segment, bills it and decides restart vs terminal.
+func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
+	round render.Round, now time.Time, reason string, _ bool) (ctrl.Result, error) {
+
+	r.closeSegment(task, now, reason)
+	r.deleteRound(ctx, task, round)
+
+	success := reason == trainpilotv1alpha1.ReasonSucceeded
+	if success {
+		task.Status.Phase = trainpilotv1alpha1.PhaseSucceeded
+		task.Status.Reason = reason
+		task.Status.Message = "成功：所有 worker 正常退出"
+		task.Status.CompletionTime = timePtr(now)
+		r.event(task, corev1.EventTypeNormal, "Succeeded", "all workers exited successfully")
+		return ctrl.Result{}, nil
+	}
+
+	// Classify: preemption spends the platform budget, everything else the
+	// user-facing restart budget (PRD 7.7.1 / 7.7.2).
+	if reason == trainpilotv1alpha1.ReasonPreempted {
+		task.Status.PreemptionCount++
+	} else {
+		task.Status.RestartCount++
+	}
+	task.Status.Message = fmt.Sprintf("恢复中：第 %d 轮结束（%s）", round.Round, reason)
+	r.event(task, corev1.EventTypeWarning, "RoundFailed", fmt.Sprintf("round %d ended: %s", round.Round, reason))
+
+	maxRestarts := task.Spec.EffectiveMaxRestarts()
+	maxPreemptions := task.Spec.EffectiveMaxPreemptions()
+	task.Status.MaxRestarts = maxRestarts
+	task.Status.MaxPreemptions = maxPreemptions
+
+	if task.Status.PreemptionCount > maxPreemptions {
+		return r.terminal(ctx, task, now, trainpilotv1alpha1.PhaseInterrupted,
+			trainpilotv1alpha1.ReasonPreemptionsExhausted, "已中断：抢占重排次数已达上限")
+	}
+	if task.Status.RestartCount > maxRestarts {
+		return r.terminal(ctx, task, now, trainpilotv1alpha1.PhaseFailed,
+			trainpilotv1alpha1.ReasonRestartsExhausted, "失败：自动重启次数已达上限")
+	}
+
+	// Back off a little so a crash loop cannot spin the API server.
+	backoff := time.Duration(min(10*int(task.Status.RestartCount)+5, 60)) * time.Second
+	task.Status.Phase = trainpilotv1alpha1.PhaseRecovering
+	task.Status.Round = round.Round + 1
+	task.Status.QueuedSince = timePtr(now.Add(backoff))
+	task.Status.StartingStep = ""
+	return ctrl.Result{RequeueAfter: backoff}, nil
+}
+
+func (r *TrainTaskReconciler) terminal(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
+	now time.Time, phase trainpilotv1alpha1.TrainTaskPhase, reason, message string) (ctrl.Result, error) {
+	task.Status.Phase = phase
+	task.Status.Reason = reason
+	task.Status.Message = message
+	task.Status.CompletionTime = timePtr(now)
+	r.event(task, corev1.EventTypeWarning, reason, message)
+	return ctrl.Result{}, nil
+}
+
+// endRun closes an open segment and terminates the run.
+func (r *TrainTaskReconciler) endRun(ctx context.Context, task *trainpilotv1alpha1.TrainTask, now time.Time, reason string) {
+	r.closeSegment(task, now, reason)
+	round := render.Round{RunID: task.Spec.RunID, Round: max(task.Status.Round, 1)}
+	r.deleteRound(ctx, task, round)
+	phase := trainpilotv1alpha1.PhaseFailed
+	switch reason {
+	case trainpilotv1alpha1.ReasonMaxRuntimeExceeded:
+		phase = trainpilotv1alpha1.PhaseFailed
+	case trainpilotv1alpha1.ReasonUserStopped:
+		phase = trainpilotv1alpha1.PhaseStopped
+	}
+	task.Status.Phase = phase
+	task.Status.Reason = reason
+	task.Status.Message = "失败：已达最长运行时长，任务终止"
+	task.Status.CompletionTime = timePtr(now)
+	r.event(task, corev1.EventTypeWarning, reason, task.Status.Message)
+}
+
+// stopRound closes the segment and removes the round's objects.
+func (r *TrainTaskReconciler) stopRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask, now time.Time, reason string) {
+	r.closeSegment(task, now, reason)
+	round := render.Round{RunID: task.Spec.RunID, Round: max(task.Status.Round, 1)}
+	r.deleteRound(ctx, task, round)
+}
+
+// beginRun resets per-run state when spec.runID changes (PRD 7.5: 重跑).
+func (r *TrainTaskReconciler) beginRun(ctx context.Context, task *trainpilotv1alpha1.TrainTask, now time.Time) error {
+	oldRun := task.Status.RunID
+
+	// Remove everything owned by the previous run.
+	var tjs trainerv1alpha1.TrainJobList
+	if err := r.List(ctx, &tjs, client.InNamespace(task.Namespace),
+		client.MatchingLabels{"trainpilot.wutz.dev/task": task.Name}); err != nil {
+		return err
+	}
+	for i := range tjs.Items {
+		if ref := metav1.GetControllerOf(&tjs.Items[i]); ref == nil || ref.UID != task.UID {
+			continue
+		}
+		if err := r.Delete(ctx, &tjs.Items[i]); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+
+	var rts trainerv1alpha1.TrainingRuntimeList
+	if err := r.List(ctx, &rts, client.InNamespace(task.Namespace),
+		client.MatchingLabels{"trainpilot.wutz.dev/task": task.Name}); err != nil {
+		return err
+	}
+	for i := range rts.Items {
+		if err := r.Delete(ctx, &rts.Items[i]); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+
+	task.Status.RunID = task.Spec.RunID
+	task.Status.Round = 1
+	task.Status.RestartCount = 0
+	task.Status.PreemptionCount = 0
+	task.Status.ExcludedNodes = nil
+	task.Status.BilledSeconds = 0
+	task.Status.AccumulatedCost = trainpilotv1alpha1.ZeroMoney
+	task.Status.Segments = nil
+	task.Status.Workers = nil
+	task.Status.StartedAt = nil
+	task.Status.CompletionTime = nil
+	task.Status.SegmentStartedAt = nil
+	task.Status.AppliedAction = ""
+	task.Status.Phase = trainpilotv1alpha1.PhaseQueued
+	task.Status.Message = "排队中"
+	if oldRun != 0 {
+		r.event(task, corev1.EventTypeNormal, "RunStarted", fmt.Sprintf("run %d started", task.Spec.RunID))
+	}
+	return nil
+}
+
+// retryRound prepares the next attempt in the same run: same RUN_ID, counters
+// kept, segment closed, workers forgotten.
+func (r *TrainTaskReconciler) retryRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
+	now time.Time, round render.Round, reason string) {
+	r.closeSegment(task, now, reason)
+	r.deleteRound(ctx, task, round)
+	task.Status.Phase = trainpilotv1alpha1.PhaseRecovering
+	task.Status.Round = round.Round + 1
+	task.Status.Workers = nil
+	task.Status.QueuedSince = timePtr(now)
+}
+
+func (r *TrainTaskReconciler) deleteRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask, round render.Round) {
+	task.Status.StartedRound = 0
+	name := render.Names(task.Name, round)
+	_ = r.Delete(ctx, &trainerv1alpha1.TrainJob{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: task.Namespace}})
+	_ = r.Delete(ctx, &trainerv1alpha1.TrainingRuntime{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: task.Namespace}})
+}
+
+// roundPods lists the worker pods of one round.
+func (r *TrainTaskReconciler) roundPods(ctx context.Context, task *trainpilotv1alpha1.TrainTask, round render.Round) ([]corev1.Pod, error) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(task.Namespace), client.MatchingLabels{
+		"trainpilot.wutz.dev/task": task.Name,
+		roundLabel:                 strconv.Itoa(int(round.Round)),
+	}); err != nil {
+		return nil, err
+	}
+	out := make([]corev1.Pod, 0, len(pods.Items))
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Labels[render.TrainerNodeLabel] == "trainer" || p.DeletionTimestamp.IsZero() {
+			out = append(out, *p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func allRunning(pods []corev1.Pod, want int) bool {
+	if len(pods) < want {
+		return false
+	}
+	for i := range pods {
+		if pods[i].Status.Phase != corev1.PodRunning || !podReady(&pods[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func podReady(p *corev1.Pod) bool {
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return p.Status.Phase == corev1.PodRunning
+}
+
+// markRunning opens the billed segment (PRD 7.8.2: billing starts when every
+// worker is running).
+func (r *TrainTaskReconciler) markRunning(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod, now time.Time) {
+	task.Status.Phase = trainpilotv1alpha1.PhaseRunning
+	task.Status.StartingStep = ""
+	task.Status.QueuedSince = nil
+	task.Status.Message = "运行中"
+	if task.Status.StartedAt == nil {
+		task.Status.StartedAt = timePtr(now)
+	}
+	if task.Status.SegmentStartedAt == nil {
+		task.Status.SegmentStartedAt = timePtr(now)
+	}
+	task.Status.Segments = append(task.Status.Segments, trainpilotv1alpha1.RunSegment{
+		RunID:              task.Spec.RunID,
+		Round:              task.Status.Round,
+		StartedAt:          timePtr(now),
+		Workers:            task.Spec.Workers,
+		PricePerWorkerHour: task.Spec.PricePerWorkerHour,
+	})
+	r.setCondition(task, ConditionWorkersReady, metav1.ConditionTrue, "AllRunning", "all workers are running")
+	_ = pods
+}
+
+// updateStartingStep maps pod state onto the PRD's starting sub-steps.
+func (r *TrainTaskReconciler) updateStartingStep(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod, now time.Time) {
+	step := trainpilotv1alpha1.StepAllocatingResources
+	for i := range pods {
+		p := &pods[i]
+		switch p.Status.Phase {
+		case corev1.PodPending:
+			for _, cs := range p.Status.ContainerStatuses {
+				if cs.State.Waiting == nil {
+					continue
+				}
+				reason := cs.State.Waiting.Reason
+				switch {
+				case reason == "ContainerCreating":
+					step = laterStep(step, trainpilotv1alpha1.StepMountingStorage)
+				case reason == "CreateContainerConfigError" || reason == "CreateContainerError":
+					step = laterStep(step, trainpilotv1alpha1.StepMountingStorage)
+				case strings.Contains(reason, "ImagePull") || reason == "ErrImagePull":
+					step = laterStep(step, trainpilotv1alpha1.StepPullingImage)
+				default:
+					step = laterStep(step, trainpilotv1alpha1.StepStartingContainers)
+				}
+			}
+			for _, cond := range p.Status.Conditions {
+				if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse &&
+					cond.Reason == corev1.PodReasonUnschedulable {
+					step = trainpilotv1alpha1.StepAllocatingResources
+				}
+			}
+		case corev1.PodRunning:
+			step = laterStep(step, trainpilotv1alpha1.StepStartingContainers)
+		}
+	}
+	task.Status.StartingStep = step
+	task.Status.Message = fmt.Sprintf("启动中：%s", step)
+	_ = now
+}
+
+func laterStep(cur, next string) string {
+	order := map[string]int{
+		trainpilotv1alpha1.StepAllocatingResources: 0,
+		trainpilotv1alpha1.StepMountingStorage:     1,
+		trainpilotv1alpha1.StepPullingImage:        2,
+		trainpilotv1alpha1.StepStartingContainers:  3,
+	}
+	if order[next] > order[cur] {
+		return next
+	}
+	return cur
+}
+
+// detectStartupFailure returns a reason when the round cannot start: image pull
+// or config errors (PRD 7.7.4) or a startup that exceeds startupTimeout (7.7.5).
+func (r *TrainTaskReconciler) detectStartupFailure(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
+	pods []corev1.Pod, now time.Time) string {
+	for i := range pods {
+		for _, cs := range pods[i].Status.ContainerStatuses {
+			if cs.State.Waiting == nil {
+				continue
+			}
+			switch cs.State.Waiting.Reason {
+			case "ImagePullBackOff", "ErrImagePull", "InvalidImageName":
+				task.Status.Message = "启动失败：" + cs.State.Waiting.Message
+				return trainpilotv1alpha1.ReasonStartupCheckFailed
+			case "CreateContainerConfigError":
+				task.Status.Message = "启动失败：" + cs.State.Waiting.Message
+				return trainpilotv1alpha1.ReasonStartupCheckFailed
+			}
+		}
+	}
+	if task.Status.QueuedSince != nil && now.Sub(task.Status.QueuedSince.Time) > startupTimeout {
+		return trainpilotv1alpha1.ReasonStartupCheckFailed
+	}
+	// Starting is timestamped by the earliest pod; fall back to segment start.
+	for i := range pods {
+		if started := pods[i].Status.StartTime; started != nil && now.Sub(started.Time) > startupTimeout {
+			return trainpilotv1alpha1.ReasonStartupCheckFailed
+		}
+	}
+	return ""
+}
+
+// detectWorkerFailure returns a reason when the round failed for infrastructure
+// reasons the TrainJob condition does not describe (node flapping, eviction).
+func (r *TrainTaskReconciler) detectWorkerFailure(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
+	round render.Round, pods []corev1.Pod) string {
+
+	for i := range pods {
+		p := &pods[i]
+		if p.Spec.NodeName == "" {
+			continue
+		}
+		var node corev1.Node
+		if err := r.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, &node); err != nil {
+			if apierrors.IsNotFound(err) {
+				r.excludeNode(task, p.Spec.NodeName)
+				return trainpilotv1alpha1.ReasonNodeFailure
+			}
+			continue
+		}
+		if !nodeReady(&node) {
+			r.excludeNode(task, p.Spec.NodeName)
+			return trainpilotv1alpha1.ReasonNodeFailure
+		}
+		// A vanished pod on a healthy node means eviction or preemption.
+		if p.DeletionTimestamp != nil {
+			return trainpilotv1alpha1.ReasonPreempted
+		}
+	}
+	return ""
+}
+
+// excludeNode records a bad node for the rest of the run, FIFO-evicting past the cap.
+func (r *TrainTaskReconciler) excludeNode(task *trainpilotv1alpha1.TrainTask, node string) {
+	for _, n := range task.Status.ExcludedNodes {
+		if n == node {
+			return
+		}
+	}
+	if len(task.Status.ExcludedNodes) >= maxExcludedNodes {
+		task.Status.ExcludedNodes = task.Status.ExcludedNodes[1:]
+	}
+	task.Status.ExcludedNodes = append(task.Status.ExcludedNodes, node)
+	r.event(task, corev1.EventTypeWarning, "NodeExcluded",
+		fmt.Sprintf("node %s excluded for the rest of run %d", node, task.Spec.RunID))
+}
+
+func nodeReady(n *corev1.Node) bool {
+	for _, c := range n.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// refreshWorkers mirrors pod placement into status (PRD 7.6 运行记录).
+func (r *TrainTaskReconciler) refreshWorkers(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod) {
+	workers := make([]trainpilotv1alpha1.WorkerPod, 0, len(pods))
+	for i := range pods {
+		p := &pods[i]
+		idx, _ := strconv.Atoi(p.Annotations["batch.kubernetes.io/job-completion-index"])
+		workers = append(workers, trainpilotv1alpha1.WorkerPod{
+			Name:        p.Name,
+			WorkerIndex: int32(idx),
+			Node:        p.Spec.NodeName,
+			Phase:       string(p.Status.Phase),
+		})
+	}
+	task.Status.Workers = workers
+}
+
+// accrueBilling updates the open segment's billed seconds and cost.
+func (r *TrainTaskReconciler) accrueBilling(task *trainpilotv1alpha1.TrainTask, now time.Time) {
+	start := task.Status.SegmentStartedAt
+	if start == nil {
+		return
+	}
+	if len(task.Status.Segments) == 0 {
+		return
+	}
+	seg := &task.Status.Segments[len(task.Status.Segments)-1]
+	if seg.EndedAt != nil {
+		return
+	}
+	seconds := int64(now.Sub(start.Time).Seconds())
+	if seconds < 0 {
+		seconds = 0
+	}
+	seg.BilledSeconds = seconds
+	seg.Amount = cost(seconds, seg.Workers, seg.PricePerWorkerHour)
+	r.recomputeTotals(task)
+}
+
+// closeSegment ends the open billing segment.
+func (r *TrainTaskReconciler) closeSegment(task *trainpilotv1alpha1.TrainTask, now time.Time, reason string) {
+	if task.Status.SegmentStartedAt == nil || len(task.Status.Segments) == 0 {
+		return
+	}
+	seg := &task.Status.Segments[len(task.Status.Segments)-1]
+	if seg.EndedAt != nil {
+		return
+	}
+	seconds := int64(now.Sub(task.Status.SegmentStartedAt.Time).Seconds())
+	if seconds < 0 {
+		seconds = 0
+	}
+	seg.BilledSeconds = seconds
+	seg.EndedAt = timePtr(now)
+	seg.EndReason = reason
+	seg.Amount = cost(seconds, seg.Workers, seg.PricePerWorkerHour)
+	r.recomputeTotals(task)
+	task.Status.SegmentStartedAt = nil
+}
+
+// recomputeTotals refreshes billed seconds and cost from the segment history.
+func (r *TrainTaskReconciler) recomputeTotals(task *trainpilotv1alpha1.TrainTask) {
+	var seconds int64
+	var amount float64
+	for i := range task.Status.Segments {
+		seconds += task.Status.Segments[i].BilledSeconds
+		amount += task.Status.Segments[i].Amount.ToFloat()
+	}
+	task.Status.BilledSeconds = seconds
+	task.Status.AccumulatedCost = trainpilotv1alpha1.MoneyFromFloat(amount)
+}
+
+func cost(seconds int64, workers int32, price trainpilotv1alpha1.Money) trainpilotv1alpha1.Money {
+	p := price.ToFloat()
+	if workers <= 0 || p <= 0 || seconds <= 0 {
+		return trainpilotv1alpha1.ZeroMoney
+	}
+	return trainpilotv1alpha1.MoneyFromFloat(float64(seconds) / 3600.0 * float64(workers) * p)
+}
+
+// trainJobOutcome extracts a terminal outcome from TrainJob conditions.
+func trainJobOutcome(tj *trainerv1alpha1.TrainJob) (bool, string) {
+	for _, c := range tj.Status.Conditions {
+		if c.Status != metav1.ConditionTrue {
+			continue
+		}
+		switch c.Type {
+		case trainerv1alpha1.TrainJobComplete:
+			return true, trainpilotv1alpha1.ReasonSucceeded
+		case trainerv1alpha1.TrainJobFailed:
+			if c.Reason == trainerv1alpha1.TrainJobDeadlineExceededReason {
+				return true, trainpilotv1alpha1.ReasonMaxRuntimeExceeded
+			}
+			return true, trainpilotv1alpha1.ReasonExitCode
+		}
+	}
+	return false, ""
+}
+
+// applyAction consumes an idempotent continue/rerun request from the annotation.
+// It returns true when state changed and a status write is needed.
+func (r *TrainTaskReconciler) applyAction(task *trainpilotv1alpha1.TrainTask) bool {
+	raw := task.Annotations[AnnotationAction]
+	if raw == "" || raw == task.Annotations[AnnotationActionApplied] {
+		return false
+	}
+	verb, id, _ := strings.Cut(raw, "=")
+	switch verb {
+	case "continue", "rerun":
+		if task.Spec.DesiredState == trainpilotv1alpha1.DesiredStateStopped {
+			task.Spec.DesiredState = trainpilotv1alpha1.DesiredStateRunning
+		}
+		task.Spec.Suspend = false
+		if verb == "rerun" {
+			// A new RUN_ID resets everything through beginRun.
+			task.Spec.RunID++
+		}
+	}
+	if task.Annotations == nil {
+		task.Annotations = map[string]string{}
+	}
+	task.Annotations[AnnotationActionApplied] = raw
+	_ = id
+	return true
+}
+
+// applyStatusAction applies the status half of a continue request (继续运行):
+// same RUN_ID, both budgets reset (PRD 7.5). Keyed on the action id so a
+// repeated annotation is applied once.
+func (r *TrainTaskReconciler) applyStatusAction(task *trainpilotv1alpha1.TrainTask) {
+	raw := task.Annotations[AnnotationAction]
+	if raw == "" || raw == task.Status.AppliedAction {
+		return
+	}
+	if verb, _, _ := strings.Cut(raw, "="); verb != "continue" {
+		return
+	}
+	task.Status.RestartCount = 0
+	task.Status.PreemptionCount = 0
+	task.Status.ExcludedNodes = nil
+	task.Status.AppliedAction = raw
+	if task.Status.Phase.IsTerminal() {
+		task.Status.Phase = trainpilotv1alpha1.PhaseQueued
+		task.Status.Reason = ""
+		task.Status.Message = "排队中"
+		task.Status.CompletionTime = nil
+		task.Status.QueuedSince = nil
+	}
+}
+
+// admit is the whole-task gang admission check (PRD 7.7: 整任务成组调度).
+// It is evaluated in FIFO order over every queued task in the namespace so two
+// tasks cannot each believe the same GPU is free.
+func (r *TrainTaskReconciler) admit(ctx context.Context, task *trainpilotv1alpha1.TrainTask) (bool, string, error) {
+	if task.Spec.Resources.GPUsPerWorker == 0 {
+		return true, "", nil
+	}
+
+	nodes, err := r.freeGPUNodes(ctx)
+	if err != nil {
+		return false, "", err
+	}
+
+	var tasks trainpilotv1alpha1.TrainTaskList
+	if err := r.List(ctx, &tasks, client.InNamespace(task.Namespace)); err != nil {
+		return false, "", err
+	}
+	// Older tasks are considered first; ties fall back to name for determinism.
+	ordered := make([]trainpilotv1alpha1.TrainTask, 0, len(tasks.Items))
+	for i := range tasks.Items {
+		ordered = append(ordered, tasks.Items[i])
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		ti, tj := ordered[i].CreationTimestamp, ordered[j].CreationTimestamp
+		if ti.Equal(&tj) {
+			return ordered[i].Name < ordered[j].Name
+		}
+		return ti.Before(&tj)
+	})
+
+	free := map[string]int32{}
+	for name, gpus := range nodes {
+		free[name] = gpus
+	}
+	freeOf := func(t *trainpilotv1alpha1.TrainTask) ([]string, error) {
+		need := t.Spec.Resources.GPUsPerWorker
+		picked := make([]string, 0, t.Spec.Workers)
+		// Spread wide first: more nodes per task leaves better packing for the rest.
+		candidates := make([]string, 0, len(free))
+		for n := range free {
+			if free[n] >= need {
+				candidates = append(candidates, n)
+			}
+		}
+		sort.Strings(candidates)
+		for _, n := range candidates {
+			if len(picked) == int(t.Spec.Workers) {
+				break
+			}
+			picked = append(picked, n)
+		}
+		if len(picked) < int(t.Spec.Workers) {
+			return nil, nil
+		}
+		return picked, nil
+	}
+
+	for i := range ordered {
+		t := &ordered[i]
+		if !t.Spec.WantsRunning() || t.Status.Phase.IsTerminal() {
+			continue
+		}
+		if t.Spec.Resources.GPUsPerWorker == 0 {
+			continue
+		}
+		picked, err := freeOf(t)
+		if err != nil || picked == nil {
+			if t.UID == task.UID {
+				return false, fmt.Sprintf("排队中：等待 %d 个节点，每节点 %d 张 GPU",
+					t.Spec.Workers, t.Spec.Resources.GPUsPerWorker), nil
+			}
+			continue
+		}
+		for _, n := range picked {
+			free[n] -= t.Spec.Resources.GPUsPerWorker
+		}
+		if t.UID == task.UID {
+			return true, "", nil
+		}
+	}
+	return false, "排队中：等待空闲 GPU 资源", nil
+}
+
+// freeGPUNodes returns allocatable minus requested GPUs per schedulable node.
+func (r *TrainTaskReconciler) freeGPUNodes(ctx context.Context) (map[string]int32, error) {
+	var nodes corev1.NodeList
+	if err := r.List(ctx, &nodes); err != nil {
+		return nil, err
+	}
+	free := map[string]int32{}
+	for i := range nodes.Items {
+		n := &nodes.Items[i]
+		if n.Spec.Unschedulable || !nodeReady(n) {
+			continue
+		}
+		alloc, ok := n.Status.Allocatable[render.GPUKey]
+		if !ok || alloc.IsZero() {
+			continue
+		}
+		free[n.Name] = int32(alloc.Value())
+	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods); err != nil {
+		return nil, err
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Spec.NodeName == "" || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		var used int64
+		for _, c := range p.Spec.Containers {
+			if q, ok := c.Resources.Requests[render.GPUKey]; ok {
+				used += q.Value()
+			}
+		}
+		if used == 0 {
+			continue
+		}
+		if cur, ok := free[p.Spec.NodeName]; ok {
+			free[p.Spec.NodeName] = max(cur-int32(used), 0)
+		}
+	}
+	return free, nil
+}
+
+func (r *TrainTaskReconciler) setCondition(task *trainpilotv1alpha1.TrainTask, condType string,
+	status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: task.Generation,
+		LastTransitionTime: metav1.NewTime(r.now()),
+	})
+}
+
+func (r *TrainTaskReconciler) event(task *trainpilotv1alpha1.TrainTask, eventType, reason, message string) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Event(task, eventType, reason, message)
+}
+
+func (r *TrainTaskReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+func timePtr(t time.Time) *metav1.Time {
+	mt := metav1.NewTime(t.UTC().Truncate(time.Second))
+	return &mt
+}
+
+// equalStatus compares the fields this controller owns, ignoring LastTransitionTime
+// churn caused by re-evaluation of unchanged conditions.
+func equalStatus(a, b *trainpilotv1alpha1.TrainTaskStatus, now time.Time) bool {
+	ac := append([]metav1.Condition{}, a.Conditions...)
+	bc := append([]metav1.Condition{}, b.Conditions...)
+	for i := range ac {
+		ac[i].LastTransitionTime = metav1.Time{}
+	}
+	for i := range bc {
+		bc[i].LastTransitionTime = metav1.Time{}
+	}
+	aa, _ := json.Marshal(struct {
+		S    trainpilotv1alpha1.TrainTaskStatus
+		Cond []metav1.Condition
+	}{*a, ac})
+	bb, _ := json.Marshal(struct {
+		S    trainpilotv1alpha1.TrainTaskStatus
+		Cond []metav1.Condition
+	}{*b, bc})
+	return string(aa) == string(bb)
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *TrainTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("trainpilot")
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&trainpilotv1alpha1.TrainTask{}).
+		Owns(&trainerv1alpha1.TrainJob{}).
+		Owns(&trainerv1alpha1.TrainingRuntime{}).
+		Watches(&jobsetv1alpha2.JobSet{}, handler.EnqueueRequestsFromMapFunc(r.mapJobSetToTask)).
+		Named("traintask").
+		Complete(r)
+}
+
+// mapJobSetToTask maps a JobSet owned by a TrainJob back to its TrainTask.
+func (r *TrainTaskReconciler) mapJobSetToTask(ctx context.Context, obj client.Object) []reconcile.Request {
+	ns := obj.GetNamespace()
+	name := obj.GetName()
+	var tj trainerv1alpha1.TrainJob
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &tj); err != nil {
+		return nil
+	}
+	if taskName, ok := tj.Labels["trainpilot.wutz.dev/task"]; ok {
+		return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: ns, Name: taskName}}}
+	}
+	return nil
+}

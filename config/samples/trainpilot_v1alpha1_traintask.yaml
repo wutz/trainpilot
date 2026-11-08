@@ -1,0 +1,18 @@
+apiVersion: trainpilot.wutz.dev/v1alpha1
+kind: TrainTask
+metadata:
+  name: traintask-sample
+spec:
+  description: 最小示例：两个 worker 各打印自己的 rank
+  image: busybox:1.36
+  command:
+    - echo "hello from node ${NODE_RANK}/${NNODES} (rank ${PET_NODE_RANK}), task ${TASK_ID} run ${RUN_ID} restart ${RESTART_COUNT}"
+  workers: 2
+  resources:
+    cpu: "2"
+    memory: 4Gi
+  pricePerWorkerHour: "1.50"
+  faultTolerance:
+    autoRestart: true
+    maxRestarts: 3
+    maxRuntimeSeconds: 600

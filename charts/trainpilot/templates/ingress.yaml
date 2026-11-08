@@ -1,0 +1,43 @@
+{{- if and .Values.ingress.enabled .Values.ui.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "trainpilot.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "trainpilot.labels" . | nindent 4 }}
+  {{- if .Values.ingress.tls.enabled }}
+  annotations:
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.ingress.tls.issuerRef }}
+    cert-manager.io/issuer-kind: {{ .Values.ingress.tls.issuerRef.kind }}
+    cert-manager.io/issuer-name: {{ .Values.ingress.tls.issuerRef.name }}
+    {{- end }}
+  {{- else }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "trainpilot.uiServiceName" . }}
+                port:
+                  number: 80
+{{- end }}

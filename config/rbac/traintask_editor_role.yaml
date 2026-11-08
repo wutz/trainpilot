@@ -1,0 +1,33 @@
+# This rule is not used by the project trainpilot itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants permissions to create, update, and delete resources within the trainpilot.wutz.dev.
+# This role is intended for users who need to manage these resources
+# but should not control RBAC or manage permissions for others.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: trainpilot
+    app.kubernetes.io/managed-by: kustomize
+  name: traintask-editor-role
+rules:
+- apiGroups:
+  - trainpilot.wutz.dev
+  resources:
+  - traintasks
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - trainpilot.wutz.dev
+  resources:
+  - traintasks/status
+  verbs:
+  - get
