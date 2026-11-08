@@ -1,8 +1,13 @@
 # bz1-dev1 部署覆盖值：集群内 GPU 节点标签为 scclabs.dev/gpu=rtx-5090，
 # 一台节点带 scclabs.dev/vgpu:NoSchedule 污点；对外入口走 ingress-nginx 的 7443。
 image:
-  repository: ghcr.io/wutz/trainpilot
-  tag: "0.1.0"
+  # 集群到 ghcr.io 的出口只有 ~36 KB/s，先用内网 Harbor 上的同一镜像验证；
+  # 换回 ghcr.io/wutz/trainpilot 时同时去掉下面的 imagePullSecrets 即可。
+  repository: cr.dev1.bz1.paratera.com:7443/forge-demo/trainpilot
+  tag: "0.1.4"
+
+imagePullSecrets:
+  - name: internal-pull
 
 ingress:
   enabled: true
