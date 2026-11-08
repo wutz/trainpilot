@@ -363,11 +363,6 @@ spec:
                 format: int32
                 minimum: 1
                 type: integer
-              runtimeRef:
-                default: torch-distributed
-                description: RuntimeRef names the ClusterTrainingRuntime used as the
-                  render base.
-                type: string
               sharedStorage:
                 description: SharedStorage is mounted read-write into every worker
                   (PRD 7.3.7).
