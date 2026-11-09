@@ -79,9 +79,12 @@ func (w *TrainTaskWebhook) ValidateUpdate(_ context.Context,
 		return nil, err
 	}
 
-	sameRun := newTask.Spec.RunID == oldTask.Spec.RunID
-	if sameRun {
-		var errs field.ErrorList
+	var errs field.ErrorList
+	if newTask.Spec.RunID < oldTask.Spec.RunID {
+		errs = append(errs, field.Invalid(field.NewPath("spec", "runID"), newTask.Spec.RunID,
+			"runID cannot decrease"))
+	}
+	if newTask.Spec.RunID == oldTask.Spec.RunID {
 		if oldTask.Spec.Image != newTask.Spec.Image {
 			errs = append(errs, field.Forbidden(field.NewPath("spec", "image"),
 				"image can only change with a re-run (increment spec.runID)"))
@@ -90,14 +93,10 @@ func (w *TrainTaskWebhook) ValidateUpdate(_ context.Context,
 			errs = append(errs, field.Forbidden(field.NewPath("spec", "command"),
 				"command can only change with a re-run (increment spec.runID)"))
 		}
-		if newTask.Spec.RunID < oldTask.Spec.RunID {
-			errs = append(errs, field.Invalid(field.NewPath("spec", "runID"), newTask.Spec.RunID,
-				"runID cannot decrease"))
-		}
-		if len(errs) > 0 {
-			return nil, apierrors.NewInvalid(schema.GroupKind{Group: trainpilotv1alpha1.GroupVersion.Group,
-				Kind: "TrainTask"}, newTask.Name, errs)
-		}
+	}
+	if len(errs) > 0 {
+		return nil, apierrors.NewInvalid(schema.GroupKind{Group: trainpilotv1alpha1.GroupVersion.Group,
+			Kind: "TrainTask"}, newTask.Name, errs)
 	}
 	return nil, nil
 }
@@ -122,9 +121,8 @@ func (w *TrainTaskWebhook) validate(task *trainpilotv1alpha1.TrainTask) error {
 	errs = append(errs, validateEnv(spec.Env)...)
 	errs = append(errs, validateMounts(spec.SharedStorage, nil, field.NewPath("spec", "sharedStorage"))...)
 	if spec.PublicData != nil {
-		errs = append(errs, validateMounts([]trainpilotv1alpha1.StorageMount{*spec.PublicData}, nil,
-			field.NewPath("spec", "publicData"))...)
-		errs = append(errs, validateMounts(nil, spec.SharedStorage, field.NewPath("spec", "publicData"))...)
+		errs = append(errs, validateMounts([]trainpilotv1alpha1.StorageMount{*spec.PublicData},
+			spec.SharedStorage, field.NewPath("spec", "publicData"))...)
 	}
 
 	if spec.Resources.GPUsPerWorker > 0 && spec.GPUType == "" {

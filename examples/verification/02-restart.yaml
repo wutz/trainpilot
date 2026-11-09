@@ -1,0 +1,27 @@
+# 自动重启：第一次运行失败，第二轮成功。
+# 期望：restartCount 从 1 涨到 1（本轮成功不再计），runID 保持 1，round 递增，
+# 中间经过 Recovering；segments 里保留失败轮次的段落。
+apiVersion: trainpilot.wutz.dev/v1alpha1
+kind: TrainTask
+metadata:
+  name: verify-restart
+spec:
+  description: 第一轮失败、第二轮成功
+  image: busybox:1.36
+  command:
+    - |
+      set -eu
+      if [ "${RESTART_COUNT}" = "0" ] && [ "${NODE_RANK}" = "0" ]; then
+        echo "round 1 fails on purpose"
+        exit 7
+      fi
+      echo "recovered on restart ${RESTART_COUNT}"
+  workers: 2
+  resources:
+    cpu: "1"
+    memory: 1Gi
+  pricePerWorkerHour: "2.00"
+  faultTolerance:
+    autoRestart: true
+    maxRestarts: 3
+    maxRuntimeSeconds: 900

@@ -9,6 +9,12 @@
 !**/*.go
 **/*_test.go
 
+# Re-include non-Go files that are embedded with //go:embed
+# (internal/ui/static/index.html is compiled into the manager binary).
+!**/*.html
+!**/*.css
+!**/*.js
+
 # Re-include Go module files
 !go.mod
 !go.sum

@@ -1,0 +1,60 @@
+# 整任务成组排队：3 个任务各要 1 个 worker、每 worker 3 张 GPU。
+# bz1-dev1 实测可用量：gn-10-243-145-106 空出 3 张（-105 已被其他租户占满，
+# -103 网络故障已 cordon）。期望：verify-queue-1 进入 Running，其余两个停在 Queued；
+# 删掉 verify-queue-1 后 verify-queue-2 立即开始。FIFO 顺序按创建时间，同一文件里按名称稳定。
+apiVersion: trainpilot.wutz.dev/v1alpha1
+kind: TrainTask
+metadata:
+  name: verify-queue-1
+spec:
+  image: busybox:1.36
+  command: ["echo holding 3 gpus; sleep 900"]
+  workers: 1
+  gpuType: rtx-5090
+  resources:
+    gpusPerWorker: 3
+    cpu: "4"
+    memory: 16Gi
+  pricePerWorkerHour: "24.00"
+  tolerations:
+    - key: scclabs.dev/vgpu
+      operator: Exists
+      effect: NoSchedule
+---
+apiVersion: trainpilot.wutz.dev/v1alpha1
+kind: TrainTask
+metadata:
+  name: verify-queue-2
+spec:
+  image: busybox:1.36
+  command: ["echo I had to wait; sleep 60"]
+  workers: 1
+  gpuType: rtx-5090
+  resources:
+    gpusPerWorker: 3
+    cpu: "4"
+    memory: 16Gi
+  pricePerWorkerHour: "24.00"
+  tolerations:
+    - key: scclabs.dev/vgpu
+      operator: Exists
+      effect: NoSchedule
+---
+apiVersion: trainpilot.wutz.dev/v1alpha1
+kind: TrainTask
+metadata:
+  name: verify-queue-3
+spec:
+  image: busybox:1.36
+  command: ["echo I had to wait too; sleep 60"]
+  workers: 1
+  gpuType: rtx-5090
+  resources:
+    gpusPerWorker: 3
+    cpu: "4"
+    memory: 16Gi
+  pricePerWorkerHour: "24.00"
+  tolerations:
+    - key: scclabs.dev/vgpu
+      operator: Exists
+      effect: NoSchedule

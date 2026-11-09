@@ -230,7 +230,7 @@ func WorkerPodSpec(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) co
 	env := platformEnv(task, r)
 	env = mergeEnv(env, spec.Env)
 
-	command := []string{"bash", "-lc", strings.Join(spec.Command, "\n")}
+	command := containerCommand(strings.Join(spec.Command, "\n"))
 
 	podSpec := corev1.PodSpec{
 		RestartPolicy:                 corev1.RestartPolicyNever,
@@ -256,6 +256,27 @@ func WorkerPodSpec(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) co
 		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 	}
 	return podSpec
+}
+
+// containerCommand turns the TrainTask command into the worker container's
+// argv.
+//
+// The entry point is /bin/sh, which every image that can run a script has:
+// busybox, alpine and the slim CUDA variants ship no bash, and pointing argv[0]
+// straight at bash fails those images at container start with "bash:
+// executable file not found in $PATH". sh then probes for bash and hands over
+// when it exists, so images that have it keep the previous `bash -lc`
+// behaviour (profile files, bash syntax) while the rest fall back to plain sh.
+//
+// The script travels as $0 rather than inline text: a fixed wrapper avoids
+// having to quote an arbitrary script into a nested -c argument.
+func containerCommand(script string) []string {
+	return []string{
+		"/bin/sh",
+		"-c",
+		`if command -v bash >/dev/null 2>&1; then exec bash -lc "$0"; fi; exec sh -c "$0"`,
+		script,
+	}
 }
 
 // platformEnv is PRD 7.3.1: the variables every worker receives. PET_* is added

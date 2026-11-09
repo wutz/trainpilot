@@ -1,0 +1,20 @@
+# 重启预算耗尽：每轮都失败，maxRestarts=2。
+# 期望：经过 3 轮后 Phase=Failed、Reason=RestartsExhausted、restartCount=3。
+apiVersion: trainpilot.wutz.dev/v1alpha1
+kind: TrainTask
+metadata:
+  name: verify-budget
+spec:
+  description: 永远失败，重启预算 2 次
+  image: busybox:1.36
+  command:
+    - echo "failing on purpose, restart=${RESTART_COUNT}"; exit 3
+  workers: 1
+  resources:
+    cpu: "1"
+    memory: 1Gi
+  pricePerWorkerHour: "1.00"
+  faultTolerance:
+    autoRestart: true
+    maxRestarts: 2
+    maxRuntimeSeconds: 900

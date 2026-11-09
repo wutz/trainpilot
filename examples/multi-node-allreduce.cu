@@ -12,8 +12,10 @@
 #include <arpa/inet.h>
 #include <cuda_runtime.h>
 #include <nccl.h>
+#include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +32,8 @@ static void die(const char *what) {
 }
 
 static void send_all(int fd, const void *buf, size_t len) {
-  const char *p = buf;
+  // nvcc compiles .cu as C++, where void* does not convert to char* implicitly.
+  const char *p = (const char *)buf;
   while (len > 0) {
     ssize_t n = send(fd, p, len, 0);
     if (n <= 0) die("send");
@@ -40,7 +43,7 @@ static void send_all(int fd, const void *buf, size_t len) {
 }
 
 static void recv_all(int fd, void *buf, size_t len) {
-  char *p = buf;
+  char *p = (char *)buf;
   while (len > 0) {
     ssize_t n = recv(fd, p, len, 0);
     if (n <= 0) die("recv");
@@ -54,16 +57,119 @@ __global__ void fill(float *v, float x, size_t n) {
   if (i < n) v[i] = x;
 }
 
+// atoi would turn Trainer's PET_NPROC_PER_NODE=auto into 0, so only a fully
+// numeric value is accepted; anything else falls back.
 static void env_int(const char *name, int *out, int fallback) {
   const char *v = getenv(name);
-  *out = (v && *v) ? atoi(v) : fallback;
+  char *end = NULL;
+  long n;
+  if (!v || !*v) {
+    *out = fallback;
+    return;
+  }
+  n = strtol(v, &end, 10);
+  *out = (end && *end == '\0' && n > 0) ? (int)n : fallback;
+}
+
+static const size_t kCount = 16 * 1024 * 1024;  // 64 MiB of float
+static const int kIters = 20;
+
+// ncclGetUniqueId and the world size are read by every GPU thread after the
+// rendezvous has finished, so they live at file scope.
+static ncclUniqueId g_id;
+static int g_world = 1;
+
+struct slot {
+  int rank;
+  int device;
+  float ms;
+  float got;
+  double want;
+  const char *err;
+};
+
+// run_gpu holds every rank that lives on this node: it initializes the rank's
+// communicator, then times kIters all-reduces and checks the summed value.
+static void *run_gpu(void *arg) {
+  struct slot *s = (struct slot *)arg;
+  if (cudaSetDevice(s->device) != cudaSuccess) {
+    s->err = "cudaSetDevice";
+    return NULL;
+  }
+  ncclComm_t comm;
+  if (ncclCommInitRank(&comm, g_world, g_id, s->rank) != ncclSuccess) {
+    s->err = "ncclCommInitRank";
+    return NULL;
+  }
+  float *buf = NULL;
+  if (cudaMalloc(&buf, kCount * sizeof(float)) != cudaSuccess) {
+    s->err = "cudaMalloc";
+    return NULL;
+  }
+  fill<<<(kCount + 255) / 256, 256>>>(buf, (float)(s->rank + 1), kCount);
+  cudaDeviceSynchronize();
+  if (ncclAllReduce(buf, buf, kCount, ncclFloat, ncclSum, comm, 0) != ncclSuccess) {
+    s->err = "ncclAllReduce warmup";
+    return NULL;
+  }
+  cudaDeviceSynchronize();
+
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaEventRecord(start);
+  for (int i = 0; i < kIters; i++) {
+    if (ncclAllReduce(buf, buf, kCount, ncclFloat, ncclSum, comm, 0) != ncclSuccess) {
+      s->err = "ncclAllReduce";
+      return NULL;
+    }
+  }
+  cudaEventRecord(stop);
+  // NCCL runs the collective on its own internal stream, so work issued to the
+  // user stream does not order after it: both the stop timestamp and the
+  // buffer read need an explicit device sync.
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    s->err = "cudaDeviceSynchronize";
+    return NULL;
+  }
+  cudaEventSynchronize(stop);
+  cudaEventElapsedTime(&s->ms, start, stop);
+
+  // The timed loop is in-place and repeated, so every iteration multiplies the
+  // buffer by the world size; its final contents can never be checked against
+  // the sum of the initial values. Refill and reduce once more for the check.
+  fill<<<(kCount + 255) / 256, 256>>>(buf, (float)(s->rank + 1), kCount);
+  cudaDeviceSynchronize();
+  if (ncclAllReduce(buf, buf, kCount, ncclFloat, ncclSum, comm, 0) != ncclSuccess) {
+    s->err = "ncclAllReduce (check)";
+    return NULL;
+  }
+  cudaDeviceSynchronize();
+
+  float got = 0;
+  cudaMemcpy(&got, buf, sizeof(float), cudaMemcpyDeviceToHost);
+  s->got = got;
+  s->want = (double)g_world * (g_world + 1) / 2.0;
+
+  ncclCommDestroy(comm);
+  cudaFree(buf);
+  return NULL;
 }
 
 int main(void) {
   int nodes = 1, node_rank = 0, gpus = 1, port = 29500;
   env_int("NNODES", &nodes, 1);
   env_int("NODE_RANK", &node_rank, 0);
-  env_int("GPUS_PER_NODE", &gpus, 1);
+  // Trainer reports PET_NPROC_PER_NODE=auto when it did not decide a count, so
+  // an unusable value means "use every visible GPU".
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1) devices = 1;
+  env_int("GPUS_PER_NODE", &gpus, devices);
+  if (gpus > devices) {
+    printf("[node %d] GPUS_PER_NODE=%d but only %d devices are visible\n",
+           node_rank, gpus, devices);
+    gpus = devices;
+  }
   env_int("MASTER_PORT", &port, 29500);
   const char *master = getenv("MASTER_ADDR");
   if (!master || !*master) die("MASTER_ADDR is not set");
@@ -119,63 +225,46 @@ int main(void) {
     recv_all(fd, &id, sizeof id);
   }
 
-  // One child per GPU; the child that breaks out of the loop owns gpu `g`.
-  int g = 0;
-  for (g = 0; g < gpus; g++) {
-    pid_t pid = (g < gpus - 1) ? fork() : 0;
-    if (pid < 0) die("fork");
-    if (pid == 0) break;
+    // One thread per GPU. A thread per device keeps every rank's CUDA context in
+  // the process that initialized it; fork() after CUDA init leaves the child
+  // with a broken runtime (cudaSetDevice fails), and the "last fork returns 0
+  // in the parent" trick also makes the parent duplicate one rank.
+  static struct slot slots[MAX_CONN];
+  pthread_t threads[MAX_CONN];
+  g_world = world;
+  g_id = id;
+  memset(slots, 0, sizeof slots);
+  for (int g = 0; g < gpus; g++) {
+    slots[g].rank = node_rank * gpus + g;
+    slots[g].device = g;
+    if (pthread_create(&threads[g], NULL, run_gpu, &slots[g]) != 0)
+      die("pthread_create");
   }
-  int rank = node_rank * gpus + g;
-  if (cudaSetDevice(g) != cudaSuccess) die("cudaSetDevice");
+  for (int g = 0; g < gpus; g++) pthread_join(threads[g], NULL);
 
-  ncclComm_t comm;
-  if (ncclCommInitRank(&comm, world, id, rank) != ncclSuccess)
-    die("ncclCommInitRank");
-
-  const size_t count = 16 * 1024 * 1024;  // 64 MiB of float
-  const int iters = 20;
-  float *buf = NULL;
-  if (cudaMalloc(&buf, count * sizeof(float)) != cudaSuccess) die("cudaMalloc");
-  fill<<<(count + 255) / 256, 256>>>(buf, (float)(rank + 1), count);
-
-  cudaDeviceSynchronize();
-  if (ncclAllReduce(buf, buf, count, ncclFloat, ncclSum, comm, 0) != ncclSuccess)
-    die("ncclAllReduce warmup");
-  cudaDeviceSynchronize();
-
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
-  cudaEventRecord(start);
-  for (int i = 0; i < iters; i++) {
-    if (ncclAllReduce(buf, buf, count, ncclFloat, ncclSum, comm, 0) != ncclSuccess)
-      die("ncclAllReduce");
+  int failed = 0;
+  for (int g = 0; g < gpus; g++) {
+    if (slots[g].err) {
+      fprintf(stderr, "[rank %d] %s failed\n", slots[g].rank, slots[g].err);
+      failed = 1;
+    } else if (fabs(slots[g].got - slots[g].want) > 1e-3) {
+      fprintf(stderr, "[rank %d] wrong result: got %f want %f\n", slots[g].rank,
+              slots[g].got, slots[g].want);
+      failed = 1;
+    }
   }
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
-  float ms = 0;
-  cudaEventElapsedTime(&ms, start, stop);
 
-  float got = 0;
-  cudaMemcpy(&got, buf, sizeof(float), cudaMemcpyDeviceToHost);
-  double want = (double)world * (world + 1) / 2.0;
-  double per_rank = (double)(count * sizeof(float)) / 1e9;
-
-  if (rank == 0) {
+  double per_rank = (double)(kCount * sizeof(float)) / 1e9;
+  float ms = slots[0].ms;
+  if (node_rank == 0) {
     printf("\n# world=%d (%d nodes x %d gpus), 64 MiB float32 sum all-reduce\n",
            world, nodes, gpus);
     printf("# bus bandwidth = %.2f GB/s, algbw = %.2f GB/s, %.3f ms/iter\n",
-           (2.0 * (world - 1) / world * per_rank) / (ms / 1000.0 / iters),
-           per_rank / (ms / 1000.0 / iters), ms / iters);
+           (2.0 * (world - 1) / world * per_rank) / (ms / 1000.0 / kIters),
+           per_rank / (ms / 1000.0 / kIters), ms / kIters);
   }
-  if (fabs((double)got - want) > 1e-3) {
-    fprintf(stderr, "[rank %d] wrong result: got %f want %f\n", rank, got, want);
-    return 1;
-  }
-  if (rank == 0) printf("RESULT: OK (all %d ranks agreed)\n", world);
-
-  ncclCommDestroy(comm);
-  cudaFree(buf);
-  return 0;
+  printf("[node %d] ranks %d-%d %s\n", node_rank, node_rank * gpus,
+         node_rank * gpus + gpus - 1, failed ? "FAILED" : "agreed");
+  if (node_rank == 0 && !failed) printf("RESULT: OK (all %d ranks agreed)\n", world);
+  return failed ? 1 : 0;
 }
