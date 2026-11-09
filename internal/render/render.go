@@ -22,6 +22,7 @@ package render
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 
@@ -141,25 +142,21 @@ func TrainingRuntime(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) 
 	podLabels[TrainerNodeLabel] = "trainer"
 
 	return &trainerv1alpha1.TrainingRuntime{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: task.Namespace,
-			Labels:    ObjectLabels(task.Name, r),
-		},
+		Name:      name,
+		Namespace: task.Namespace,
+		Labels:    ObjectLabels(task.Name, r),
 		Spec: trainerv1alpha1.TrainingRuntimeSpec{
 			MLPolicy: &trainerv1alpha1.MLPolicy{
-				NumNodes: ptr(int32(task.Spec.Workers)),
-				MLPolicySource: trainerv1alpha1.MLPolicySource{
-					Torch: &trainerv1alpha1.TorchMLPolicySource{},
-				},
+				NumNodes: new(task.Spec.Workers),
+				Torch:    &trainerv1alpha1.TorchMLPolicySource{},
 			},
 			Template: trainerv1alpha1.JobSetTemplateSpec{
 				Spec: jobsetv1alpha2.JobSetSpec{
 					// A headless Service per JobSet gives every worker a stable
 					// DNS name, which is what MASTER_ADDR points at.
 					Network: &jobsetv1alpha2.Network{
-						EnableDNSHostnames:       ptr(true),
-						PublishNotReadyAddresses: ptr(true),
+						EnableDNSHostnames:       new(true),
+						PublishNotReadyAddresses: new(true),
 					},
 					// JobSet must never restart a failed Job: the operator owns
 					// restart accounting and starts a new round instead.
@@ -176,7 +173,7 @@ func TrainingRuntime(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) 
 							Template: batchv1.JobTemplateSpec{
 								ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 								Spec: batchv1.JobSpec{
-									BackoffLimit: ptr(int32(0)),
+									BackoffLimit: new(int32(0)),
 									Template: corev1.PodTemplateSpec{
 										ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 										Spec:       WorkerPodSpec(task, r, opts),
@@ -235,7 +232,7 @@ func WorkerPodSpec(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) co
 
 	podSpec := corev1.PodSpec{
 		RestartPolicy:                 corev1.RestartPolicyNever,
-		TerminationGracePeriodSeconds: ptr(int64(30)),
+		TerminationGracePeriodSeconds: new(int64(30)),
 		Containers: []corev1.Container{{
 			Name:         NodeContainerName,
 			Image:        spec.Image,
@@ -310,11 +307,9 @@ func sharedMemoryVolume(memory resource.Quantity, ratio float64) corev1.Volume {
 	shm := resource.NewQuantity(int64(float64(memory.Value())*ratio), resource.BinarySI)
 	return corev1.Volume{
 		Name: SharedMemoryVolumeName,
-		VolumeSource: corev1.VolumeSource{
-			EmptyDir: &corev1.EmptyDirVolumeSource{
-				Medium:    corev1.StorageMediumMemory,
-				SizeLimit: shm,
-			},
+		EmptyDir: &corev1.EmptyDirVolumeSource{
+			Medium:    corev1.StorageMediumMemory,
+			SizeLimit: shm,
 		},
 	}
 }
@@ -325,11 +320,9 @@ func appendStorage(volumes []corev1.Volume, mounts []corev1.VolumeMount,
 		name := fmt.Sprintf("%s-%d", prefix, i)
 		volumes = append(volumes, corev1.Volume{
 			Name: name,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: s.ClaimName,
-					ReadOnly:  s.ReadOnly,
-				},
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: s.ClaimName,
+				ReadOnly:  s.ReadOnly,
 			},
 		})
 		mounts = append(mounts, corev1.VolumeMount{
@@ -374,9 +367,7 @@ func nodeSelector(spec *trainpilotv1alpha1.TrainTaskSpec, opts Options) map[stri
 	if spec.GPUType != "" {
 		out[gpuLabel(opts)] = spec.GPUType
 	}
-	for k, v := range spec.NodeSelector {
-		out[k] = v
-	}
+	maps.Copy(out, spec.NodeSelector)
 	if len(out) == 0 {
 		return nil
 	}
@@ -447,21 +438,19 @@ func affinity(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) *corev1
 // Job's parallelism/completions in sync with it.
 func TrainJob(task *trainpilotv1alpha1.TrainTask, r Round) *trainerv1alpha1.TrainJob {
 	name := Names(task.Name, r)
-	numNodes := int32(task.Spec.Workers)
+	numNodes := task.Spec.Workers
 	return &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: task.Namespace,
-			Labels:    ObjectLabels(task.Name, r),
-		},
+		Name:      name,
+		Namespace: task.Namespace,
+		Labels:    ObjectLabels(task.Name, r),
 		Spec: trainerv1alpha1.TrainJobSpec{
 			RuntimeRef: trainerv1alpha1.RuntimeRef{
 				Name:     name,
-				APIGroup: ptr(trainerv1alpha1.GroupVersion.Group),
-				Kind:     ptr(trainerv1alpha1.TrainingRuntimeKind),
+				APIGroup: new(trainerv1alpha1.GroupVersion.Group),
+				Kind:     new(trainerv1alpha1.TrainingRuntimeKind),
 			},
 			Trainer: &trainerv1alpha1.Trainer{
-				Image:    ptr(task.Spec.Image),
+				Image:    new(task.Spec.Image),
 				NumNodes: &numNodes,
 			},
 		},
@@ -485,5 +474,3 @@ func parseQuantity(s, fallback string) resource.Quantity {
 	}
 	return q
 }
-
-func ptr[T any](v T) *T { return &v }

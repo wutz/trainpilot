@@ -79,7 +79,7 @@ func TestRestartsExhaustedFails(t *testing.T) {
 	tk.Status.StartedRound = 2
 	tk.Status.RestartCount = 1
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 		Status: trainerv1alpha1.TrainJobStatus{
 			Conditions: []metav1.Condition{{Type: trainerv1alpha1.TrainJobFailed, Status: metav1.ConditionTrue}},
 		},
@@ -105,7 +105,7 @@ func TestCompletedTrainJobSucceeds(t *testing.T) {
 	tk := task("done", 1, 0)
 	tk.Status.StartedRound = 2
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 		Status: trainerv1alpha1.TrainJobStatus{
 			Conditions: []metav1.Condition{{Type: trainerv1alpha1.TrainJobComplete, Status: metav1.ConditionTrue}},
 		},
@@ -136,7 +136,7 @@ func TestCompletedTrainJobSucceedsFromStarting(t *testing.T) {
 	round := render.Round{RunID: 1, Round: 2}
 
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, round), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, round), Namespace: tk.Namespace,
 		Status: trainerv1alpha1.TrainJobStatus{
 			Conditions: []metav1.Condition{{Type: trainerv1alpha1.TrainJobComplete, Status: metav1.ConditionTrue}},
 		},
@@ -170,7 +170,7 @@ func TestMaxRuntimeIsEnforcedOnMeteredTime(t *testing.T) {
 		RunID: 1, Round: 2, StartedAt: timePtr(fixedNow.Add(-time.Hour)),
 		Workers: 2}}
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 	}
 	r, c := newReconciler(t, tk, tj)
 
@@ -255,7 +255,7 @@ func TestNodeFailureExcludesNode(t *testing.T) {
 	tk.Status.StartedRound = 2
 	pod := workerPod(tk.Name, 2, "gn-gone")
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 	}
 	r, c := newReconciler(t, tk, pod, tj)
 
@@ -301,7 +301,7 @@ func TestStopReleasesWorkers(t *testing.T) {
 		RunID: 1, Round: 2, StartedAt: timePtr(fixedNow.Add(-30 * time.Minute)),
 		Workers: 1}}
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 	}
 	r, c := newReconciler(t, tk, tj)
 
@@ -378,17 +378,15 @@ func TestContinueKeepsRunAndResetsBudgets(t *testing.T) {
 
 func workerPod(taskName string, round int32, node string) *corev1.Pod {
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      taskName + "-node-0-0",
-			Namespace: "trainpilot",
-			Labels: map[string]string{
-				"trainpilot.wutz.dev/task": taskName,
-				roundLabel:                 strconv.Itoa(int(round)),
-				render.TrainerNodeLabel:    "trainer",
-			},
-			Annotations: map[string]string{"batch.kubernetes.io/job-completion-index": "0"},
+		Name:      taskName + "-node-0-0",
+		Namespace: testNamespace,
+		Labels: map[string]string{
+			"trainpilot.wutz.dev/task": taskName,
+			roundLabel:                 strconv.Itoa(int(round)),
+			render.TrainerNodeLabel:    "trainer",
 		},
-		Spec:   corev1.PodSpec{NodeName: node},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		Annotations: map[string]string{"batch.kubernetes.io/job-completion-index": "0"},
+		Spec:        corev1.PodSpec{NodeName: node},
+		Status:      corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 }

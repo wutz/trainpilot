@@ -29,7 +29,8 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -174,7 +175,7 @@ func writeTasks(w http.ResponseWriter, r *http.Request, c client.Reader) {
 		}
 		views = append(views, v)
 	}
-	sort.Slice(views, func(i, j int) bool { return views[i].CreatedAt > views[j].CreatedAt })
+	slices.SortFunc(views, func(a, b taskView) int { return strings.Compare(b.CreatedAt, a.CreatedAt) })
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")

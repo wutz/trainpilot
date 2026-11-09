@@ -257,7 +257,7 @@ func main() {
 // splitList parses a comma-separated flag value, dropping blanks.
 func splitList(v string) []string {
 	out := []string{}
-	for _, part := range strings.Split(v, ",") {
+	for part := range strings.SplitSeq(v, ",") {
 		if p := strings.TrimSpace(part); p != "" {
 			out = append(out, p)
 		}

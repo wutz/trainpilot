@@ -49,6 +49,8 @@ func testScheme(t *testing.T) *runtime.Scheme {
 }
 
 // fixedNow keeps metering math deterministic.
+const testNamespace = "trainpilot"
+
 var fixedNow = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
 func newReconciler(t *testing.T, objs ...client.Object) (*TrainTaskReconciler, client.Client) {
@@ -72,7 +74,7 @@ func newReconciler(t *testing.T, objs ...client.Object) (*TrainTaskReconciler, c
 func reconcileOnce(t *testing.T, r *TrainTaskReconciler, name string) ctrl.Result {
 	t.Helper()
 	res, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Namespace: "trainpilot", Name: name},
+		Namespace: testNamespace, Name: name,
 	})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -83,7 +85,7 @@ func reconcileOnce(t *testing.T, r *TrainTaskReconciler, name string) ctrl.Resul
 func getTask(t *testing.T, c client.Client, name string) *trainpilotv1alpha1.TrainTask {
 	t.Helper()
 	var task trainpilotv1alpha1.TrainTask
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "trainpilot", Name: name}, &task); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: name}, &task); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
 	return &task
@@ -92,12 +94,10 @@ func getTask(t *testing.T, c client.Client, name string) *trainpilotv1alpha1.Tra
 // task builds a TrainTask with a run already in progress at round 2.
 func task(name string, workers, gpus int32) *trainpilotv1alpha1.TrainTask {
 	return &trainpilotv1alpha1.TrainTask{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              name,
-			Namespace:         "trainpilot",
-			UID:               types.UID("uid-" + name),
-			CreationTimestamp: metav1.NewTime(fixedNow.Add(-time.Hour)),
-		},
+		Name:              name,
+		Namespace:         testNamespace,
+		UID:               types.UID("uid-" + name),
+		CreationTimestamp: metav1.NewTime(fixedNow.Add(-time.Hour)),
 		Spec: trainpilotv1alpha1.TrainTaskSpec{
 			Image:          "busybox:latest",
 			Command:        []string{"echo hello"},
@@ -118,7 +118,7 @@ func task(name string, workers, gpus int32) *trainpilotv1alpha1.TrainTask {
 
 func gpuNode(name string, gpus int64) *corev1.Node {
 	return &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Name: name,
 		Status: corev1.NodeStatus{
 			Allocatable: corev1.ResourceList{
 				render.GPUKey: *resource.NewQuantity(gpus, resource.DecimalSI),

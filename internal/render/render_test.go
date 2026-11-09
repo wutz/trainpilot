@@ -22,14 +22,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	trainpilotv1alpha1 "github.com/wutz/trainpilot/api/v1alpha1"
 )
 
 func task(workers, gpus int32) *trainpilotv1alpha1.TrainTask {
 	return &trainpilotv1alpha1.TrainTask{
-		ObjectMeta: metav1.ObjectMeta{Name: "nccl", Namespace: "trainpilot"},
+		Name: "nccl", Namespace: "trainpilot",
 		Spec: trainpilotv1alpha1.TrainTaskSpec{
 			Image:   "example/nccl:latest",
 			Command: []string{"echo hello"},

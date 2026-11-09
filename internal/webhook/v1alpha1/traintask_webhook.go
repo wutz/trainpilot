@@ -204,7 +204,7 @@ func checkMountPath(p string) error {
 	case strings.ContainsAny(p, " \t\n"):
 		return fmt.Errorf("must not contain whitespace")
 	case strings.Contains(p, ".."):
-		return fmt.Errorf("must not contain ..")
+		return fmt.Errorf("must not contain a parent directory segment")
 	}
 	return nil
 }
