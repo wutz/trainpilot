@@ -16,10 +16,9 @@ limitations under the License.
 
 // Package v1alpha1 implements admission for TrainTask.
 //
-// The webhook enforces the create-form rules from PRD 7.3.4 and 7.3.3:
-// environment variable names, platform-reserved names, mount path shape and
-// overlap, and the "keep image/command on continue, change them with re-run"
-// rule from PRD 7.5.1.
+// The webhook enforces the create-form rules: environment variable names,
+// reserved names, mount path shape and overlap, and the "keep image/command on
+// continue, change them with re-run" rule.
 package v1alpha1
 
 import (
@@ -40,10 +39,10 @@ import (
 	trainpilotv1alpha1 "github.com/wutz/trainpilot/api/v1alpha1"
 )
 
-// envNamePattern is PRD 7.3.3: [A-Za-z_][A-Za-z0-9_]*, at most 128 characters.
+// envNamePattern is [A-Za-z_][A-Za-z0-9_]*, at most 128 characters.
 var envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// reservedEnv are injected by the platform and must not be overridden (PRD 7.3.1).
+// reservedEnv are injected by the operator and must not be overridden.
 var reservedEnv = map[string]bool{
 	"TASK_ID": true, "RUN_ID": true, "RESTART_COUNT": true,
 	"NNODES": true, "NODE_RANK": true, "MASTER_ADDR": true, "MASTER_PORT": true,
@@ -72,7 +71,7 @@ func (w *TrainTaskWebhook) ValidateCreate(_ context.Context, task *trainpilotv1a
 // ValidateUpdate implements webhook.CustomValidator.
 //
 // Re-run (spec.runID increments) may change the image and command; an automatic
-// restart or a continue (same runID) may not (PRD 7.5.1).
+// restart or a continue (same runID) may not.
 func (w *TrainTaskWebhook) ValidateUpdate(_ context.Context,
 	oldTask, newTask *trainpilotv1alpha1.TrainTask) (admission.Warnings, error) {
 	if err := w.validate(newTask); err != nil {
@@ -164,7 +163,7 @@ func validateEnv(env []corev1.EnvVar) field.ErrorList {
 	return errs
 }
 
-// validateMounts checks PRD 7.3.4: absolute path, no spaces, no "..", not "/",
+// validateMounts checks absolute path, no spaces, no "..", not "/",
 // and no overlap with the other list.
 func validateMounts(list []trainpilotv1alpha1.StorageMount, others []trainpilotv1alpha1.StorageMount,
 	path *field.Path) field.ErrorList {
@@ -205,7 +204,7 @@ func checkMountPath(p string) error {
 	case strings.ContainsAny(p, " \t\n"):
 		return fmt.Errorf("must not contain whitespace")
 	case strings.Contains(p, ".."):
-		return fmt.Errorf("must not contain ..")
+		return fmt.Errorf("must not contain a parent directory segment")
 	}
 	return nil
 }

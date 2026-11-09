@@ -293,17 +293,16 @@ spec:
       # program itself clamps to the GPUs actually visible in the container.
       NODE_RANK="${NODE_RANK:-0}" GPUS_PER_NODE="${PET_NPROC_PER_NODE}" /tmp/allreduce
   workers: 2
-  gpuType: rtx-5090
+  gpuType: NVIDIA-A100-SXM4-80GB
   resources:
     gpusPerWorker: 8
     cpu: "32"
     memory: 128Gi
-  pricePerWorkerHour: "24.00"
   faultTolerance:
     autoRestart: true
     maxRestarts: 3
     maxRuntimeSeconds: 3600
   tolerations:
-    - key: scclabs.dev/vgpu
+    - key: nvidia.com/gpu
       operator: Exists
       effect: NoSchedule

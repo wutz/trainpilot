@@ -22,14 +22,15 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	trainpilotv1alpha1 "github.com/wutz/trainpilot/api/v1alpha1"
 )
 
+const testMount = "/data"
+
 func mkTask() *trainpilotv1alpha1.TrainTask {
 	return &trainpilotv1alpha1.TrainTask{
-		ObjectMeta: metav1.ObjectMeta{Name: "t", Namespace: "n"},
+		Name: "t", Namespace: "n",
 		Spec: trainpilotv1alpha1.TrainTaskSpec{
 			Image:   "busybox:1.36",
 			Command: []string{"echo hi"},
@@ -116,7 +117,7 @@ func TestCreateRejectsOverlappingMounts(t *testing.T) {
 	w := &TrainTaskWebhook{}
 	task := mkTask()
 	task.Spec.SharedStorage = []trainpilotv1alpha1.StorageMount{
-		{ClaimName: "a", MountPath: "/data"},
+		{ClaimName: "a", MountPath: testMount},
 		{ClaimName: "b", MountPath: "/data/nested"},
 	}
 	if _, err := w.ValidateCreate(context.Background(), task); err == nil {
@@ -125,7 +126,7 @@ func TestCreateRejectsOverlappingMounts(t *testing.T) {
 
 	// Public data must not overlap a shared mount either.
 	task = mkTask()
-	task.Spec.SharedStorage = []trainpilotv1alpha1.StorageMount{{ClaimName: "a", MountPath: "/data"}}
+	task.Spec.SharedStorage = []trainpilotv1alpha1.StorageMount{{ClaimName: "a", MountPath: testMount}}
 	task.Spec.PublicData = &trainpilotv1alpha1.StorageMount{ClaimName: "p", MountPath: "/data/public"}
 	if _, err := w.ValidateCreate(context.Background(), task); err == nil {
 		t.Fatal("public data overlapping shared storage must be rejected")
@@ -134,7 +135,7 @@ func TestCreateRejectsOverlappingMounts(t *testing.T) {
 	// Sibling paths are fine.
 	task = mkTask()
 	task.Spec.SharedStorage = []trainpilotv1alpha1.StorageMount{
-		{ClaimName: "a", MountPath: "/data"},
+		{ClaimName: "a", MountPath: testMount},
 		{ClaimName: "b", MountPath: "/data2"},
 	}
 	if _, err := w.ValidateCreate(context.Background(), task); err != nil {

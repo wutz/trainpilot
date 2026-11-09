@@ -10,7 +10,7 @@ kubectl -n $NS get traintask verify-basic -w
 
 | 文件 | 场景 | 期望 |
 | --- | --- | --- |
-| `01-basic.yaml` | 2 worker 正常退出 | `Succeeded`，`billedSeconds>0`，两个 worker 的 `NODE_RANK` 分别为 0/1 |
+| `01-basic.yaml` | 2 worker 正常退出 | `Succeeded`，`meteredSeconds>0`，两个 worker 的 `NODE_RANK` 分别为 0/1 |
 | `02-restart.yaml` | 第一轮失败、第二轮成功 | 经历 `Recovering`，`restartCount=1`，`round=2`，最终 `Succeeded`，`runID` 不变 |
 | `03-budget.yaml` | 永远失败，`maxRestarts=2` | 3 轮后 `Failed`，`reason=RestartsExhausted`，`restartCount=3` |
 | `04-max-runtime.yaml` | 运行超过 120s | `Failed`，`reason=MaxRuntimeExceeded`，worker 被回收 |
@@ -26,7 +26,7 @@ kubectl annotate traintask verify-basic trainpilot.wutz.dev/action=continue=$(da
 kubectl annotate traintask verify-basic trainpilot.wutz.dev/action=rerun=$(date +%s)
 ```
 
-抢占重排（平台侧回收当前轮）：
+抢占重排（operator 侧回收当前轮）：
 
 ```bash
 kubectl -n $NS delete trainjob -l trainpilot.wutz.dev/task=verify-basic

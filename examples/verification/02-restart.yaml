@@ -20,7 +20,6 @@ spec:
   resources:
     cpu: "1"
     memory: 1Gi
-  pricePerWorkerHour: "2.00"
   faultTolerance:
     autoRestart: true
     maxRestarts: 3

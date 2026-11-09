@@ -20,7 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -31,13 +32,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/recorder"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 
 	trainerv1alpha1 "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
@@ -66,29 +67,27 @@ const (
 	// AnnotationActionApplied mirrors the last applied action id.
 	AnnotationActionApplied = "trainpilot.wutz.dev/applied-action"
 
+	// taskLabel names the owning TrainTask on every object of a round.
+	taskLabel = "trainpilot.wutz.dev/task"
+
 	// roundLabel selects the TrainJob of the current round.
 	roundLabel = "trainpilot.wutz.dev/round"
 
 	// queueRequeue is how often a queued task re-evaluates admission.
 	queueRequeue = 10 * time.Second
-	// runningRequeue is how often a running task refreshes billed seconds.
+	// runningRequeue is how often a running task refreshes metered seconds.
 	runningRequeue = 30 * time.Second
 	// startupTimeout bounds Starting before the round counts as a failed startup.
 	startupTimeout = 15 * time.Minute
-	// pendingGrace lets freshly created pods settle before they count as failures.
-	pendingGrace = 5 * time.Minute
-
-	// maxExcludedNodes is the PRD 7.7.7 cap on per-run exclusion.
+	// maxExcludedNodes is the cap on per-run node exclusion.
 	maxExcludedNodes = 8
-	// historyRounds is how many finished rounds are retained.
-	historyRounds = 3
 )
 
 // TrainTaskReconciler reconciles a TrainTask object.
 type TrainTaskReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Recorder recorder.EventRecorder
 
 	// GPULabel, GPUTolerationKeys, SharedMemoryRatio and ServiceAccountName are
 	// operator-wide render options (flags in main.go).
@@ -136,11 +135,11 @@ func (r *TrainTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// continue resets counters, so both writes can be needed at once.
 		if err := r.Update(ctx, &task); err != nil {
 			if apierrors.IsConflict(err) {
-				return ctrl.Result{Requeue: true}, nil
+				return ctrl.Result{RequeueAfter: time.Second}, nil
 			}
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	// A continue request resets per-run budgets, which is a status change and is
@@ -149,7 +148,7 @@ func (r *TrainTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// A new spec.runID starts a fresh run: counters, exclusions, segments reset.
 	if task.Spec.RunID != task.Status.RunID {
-		if err := r.beginRun(ctx, &task, now); err != nil {
+		if err := r.beginRun(ctx, &task); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -159,10 +158,10 @@ func (r *TrainTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	if !equalStatus(origStatus, &task.Status, now) {
+	if !equalStatus(origStatus, &task.Status) {
 		if err := r.Status().Update(ctx, &task); err != nil {
 			if apierrors.IsConflict(err) {
-				return ctrl.Result{Requeue: true}, nil
+				return ctrl.Result{RequeueAfter: time.Second}, nil
 			}
 			return ctrl.Result{}, err
 		}
@@ -203,9 +202,9 @@ func (r *TrainTaskReconciler) reconcile(ctx context.Context, task *trainpilotv1a
 	task.Status.Round = round.Round
 	task.Status.RunID = task.Spec.RunID
 
-	// Max runtime is measured on billed time (PRD 7.3.2 / 7.8), not wall clock.
-	r.accrueBilling(task, now)
-	if limit := task.Spec.FaultTolerance.MaxRuntimeSeconds; limit > 0 && task.Status.BilledSeconds >= limit {
+	// Max runtime is measured on metered time, not wall clock.
+	r.accrueMetering(task, now)
+	if limit := task.Spec.FaultTolerance.MaxRuntimeSeconds; limit > 0 && task.Status.MeteredSeconds >= limit {
 		r.endRun(ctx, task, now, trainpilotv1alpha1.ReasonMaxRuntimeExceeded)
 		return ctrl.Result{}, nil
 	}
@@ -236,9 +235,9 @@ func (r *TrainTaskReconciler) startOrQueue(ctx context.Context, task *trainpilot
 		task.Status.QueuedSince = timePtr(now)
 	}
 
-	// Queue timeout is per wait (PRD 7.7): exceed it and the task is interrupted.
+	// Queue timeout is per wait: exceed it and the task is interrupted.
 	// A timeout can also fire mid-restart, when the previous round was already
-	// billed, so close whatever segment is open and drop stale round objects.
+	// metered, so close whatever segment is open and drop stale round objects.
 	timeout := time.Duration(task.Spec.FaultTolerance.QueueTimeoutSeconds) * time.Second
 	if timeout > 0 && now.Sub(task.Status.QueuedSince.Time) > timeout {
 		r.stopRound(ctx, task, now, trainpilotv1alpha1.ReasonQueueTimeout)
@@ -313,7 +312,7 @@ func (r *TrainTaskReconciler) observeRound(ctx context.Context, task *trainpilot
 		return ctrl.Result{}, err
 	}
 
-	// PRD 7.4: Starting resolves into Running only when every worker runs.
+	// Starting resolves into Running only when every worker runs.
 	switch task.Status.Phase {
 	case trainpilotv1alpha1.PhaseQueued, "":
 		task.Status.Phase = trainpilotv1alpha1.PhaseStarting
@@ -329,7 +328,7 @@ func (r *TrainTaskReconciler) observeRound(ctx context.Context, task *trainpilot
 			return ctrl.Result{RequeueAfter: runningRequeue}, nil
 		}
 		r.updateStartingStep(task, pods, now)
-		if stepFailed := r.detectStartupFailure(ctx, task, pods, now); stepFailed != "" {
+		if stepFailed := r.detectStartupFailure(task, pods, now); stepFailed != "" {
 			return r.finishRound(ctx, task, round, now, stepFailed, false)
 		}
 		// A short round can start and finish between two polls, so the phase is
@@ -346,15 +345,15 @@ func (r *TrainTaskReconciler) observeRound(ctx context.Context, task *trainpilot
 	if done, reason := trainJobOutcome(tj); done {
 		return r.finishRound(ctx, task, round, now, reason, false)
 	}
-	if failed := r.detectWorkerFailure(ctx, task, round, pods); failed != "" {
+	if failed := r.detectWorkerFailure(ctx, task, pods); failed != "" {
 		return r.finishRound(ctx, task, round, now, failed, false)
 	}
 
-	r.accrueBilling(task, now)
+	r.accrueMetering(task, now)
 	return ctrl.Result{RequeueAfter: runningRequeue}, nil
 }
 
-// finishRound closes the segment, bills it and decides restart vs terminal.
+// finishRound closes the segment, meters it and decides restart vs terminal.
 func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
 	round render.Round, now time.Time, reason string, _ bool) (ctrl.Result, error) {
 
@@ -378,8 +377,8 @@ func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv
 	// requests counted against the next round's admission.
 	r.deleteRound(ctx, task, round)
 
-	// Classify: preemption spends the platform budget, everything else the
-	// user-facing restart budget (PRD 7.7.1 / 7.7.2).
+	// Classify: preemption spends the operator-side budget, everything else the
+	// user-facing restart budget.
 	if reason == trainpilotv1alpha1.ReasonPreempted {
 		task.Status.PreemptionCount++
 	} else {
@@ -394,11 +393,11 @@ func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv
 	task.Status.MaxPreemptions = maxPreemptions
 
 	if task.Status.PreemptionCount > maxPreemptions {
-		return r.terminal(ctx, task, now, trainpilotv1alpha1.PhaseInterrupted,
+		return r.terminal(task, now, trainpilotv1alpha1.PhaseInterrupted,
 			trainpilotv1alpha1.ReasonPreemptionsExhausted, "已中断：抢占重排次数已达上限")
 	}
 	if task.Status.RestartCount > maxRestarts {
-		return r.terminal(ctx, task, now, trainpilotv1alpha1.PhaseFailed,
+		return r.terminal(task, now, trainpilotv1alpha1.PhaseFailed,
 			trainpilotv1alpha1.ReasonRestartsExhausted, "失败：自动重启次数已达上限")
 	}
 
@@ -411,7 +410,7 @@ func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv
 	return ctrl.Result{RequeueAfter: backoff}, nil
 }
 
-func (r *TrainTaskReconciler) terminal(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
+func (r *TrainTaskReconciler) terminal(task *trainpilotv1alpha1.TrainTask,
 	now time.Time, phase trainpilotv1alpha1.TrainTaskPhase, reason, message string) (ctrl.Result, error) {
 	task.Status.Phase = phase
 	task.Status.Reason = reason
@@ -447,14 +446,14 @@ func (r *TrainTaskReconciler) stopRound(ctx context.Context, task *trainpilotv1a
 	r.deleteRound(ctx, task, round)
 }
 
-// beginRun resets per-run state when spec.runID changes (PRD 7.5: 重跑).
-func (r *TrainTaskReconciler) beginRun(ctx context.Context, task *trainpilotv1alpha1.TrainTask, now time.Time) error {
+// beginRun resets per-run state when spec.runID changes (重跑).
+func (r *TrainTaskReconciler) beginRun(ctx context.Context, task *trainpilotv1alpha1.TrainTask) error {
 	oldRun := task.Status.RunID
 
 	// Remove everything owned by the previous run.
 	var tjs trainerv1alpha1.TrainJobList
 	if err := r.List(ctx, &tjs, client.InNamespace(task.Namespace),
-		client.MatchingLabels{"trainpilot.wutz.dev/task": task.Name}); err != nil {
+		client.MatchingLabels{taskLabel: task.Name}); err != nil {
 		return err
 	}
 	for i := range tjs.Items {
@@ -468,7 +467,7 @@ func (r *TrainTaskReconciler) beginRun(ctx context.Context, task *trainpilotv1al
 
 	var rts trainerv1alpha1.TrainingRuntimeList
 	if err := r.List(ctx, &rts, client.InNamespace(task.Namespace),
-		client.MatchingLabels{"trainpilot.wutz.dev/task": task.Name}); err != nil {
+		client.MatchingLabels{taskLabel: task.Name}); err != nil {
 		return err
 	}
 	for i := range rts.Items {
@@ -482,8 +481,7 @@ func (r *TrainTaskReconciler) beginRun(ctx context.Context, task *trainpilotv1al
 	task.Status.RestartCount = 0
 	task.Status.PreemptionCount = 0
 	task.Status.ExcludedNodes = nil
-	task.Status.BilledSeconds = 0
-	task.Status.AccumulatedCost = trainpilotv1alpha1.ZeroMoney
+	task.Status.MeteredSeconds = 0
 	task.Status.Segments = nil
 	task.Status.Workers = nil
 	task.Status.StartedAt = nil
@@ -498,31 +496,19 @@ func (r *TrainTaskReconciler) beginRun(ctx context.Context, task *trainpilotv1al
 	return nil
 }
 
-// retryRound prepares the next attempt in the same run: same RUN_ID, counters
-// kept, segment closed, workers forgotten.
-func (r *TrainTaskReconciler) retryRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
-	now time.Time, round render.Round, reason string) {
-	r.closeSegment(task, now, reason)
-	r.deleteRound(ctx, task, round)
-	task.Status.Phase = trainpilotv1alpha1.PhaseRecovering
-	task.Status.Round = round.Round + 1
-	task.Status.Workers = nil
-	task.Status.QueuedSince = timePtr(now)
-}
-
 func (r *TrainTaskReconciler) deleteRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask, round render.Round) {
 	task.Status.StartedRound = 0
 	name := render.Names(task.Name, round)
-	_ = r.Delete(ctx, &trainerv1alpha1.TrainJob{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: task.Namespace}})
-	_ = r.Delete(ctx, &trainerv1alpha1.TrainingRuntime{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: task.Namespace}})
+	_ = r.Delete(ctx, &trainerv1alpha1.TrainJob{Name: name, Namespace: task.Namespace})
+	_ = r.Delete(ctx, &trainerv1alpha1.TrainingRuntime{Name: name, Namespace: task.Namespace})
 }
 
 // roundPods lists the worker pods of one round.
 func (r *TrainTaskReconciler) roundPods(ctx context.Context, task *trainpilotv1alpha1.TrainTask, round render.Round) ([]corev1.Pod, error) {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(task.Namespace), client.MatchingLabels{
-		"trainpilot.wutz.dev/task": task.Name,
-		roundLabel:                 strconv.Itoa(int(round.Round)),
+		taskLabel:  task.Name,
+		roundLabel: strconv.Itoa(int(round.Round)),
 	}); err != nil {
 		return nil, err
 	}
@@ -533,7 +519,7 @@ func (r *TrainTaskReconciler) roundPods(ctx context.Context, task *trainpilotv1a
 			out = append(out, *p)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	slices.SortFunc(out, func(a, b corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
 	return out, nil
 }
 
@@ -558,8 +544,8 @@ func podReady(p *corev1.Pod) bool {
 	return p.Status.Phase == corev1.PodRunning
 }
 
-// markRunning opens the billed segment (PRD 7.8.2: billing starts when every
-// worker is running).
+// markRunning opens the metered segment (metering starts when every worker is
+// running).
 func (r *TrainTaskReconciler) markRunning(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod, now time.Time) {
 	task.Status.Phase = trainpilotv1alpha1.PhaseRunning
 	task.Status.StartingStep = ""
@@ -572,19 +558,18 @@ func (r *TrainTaskReconciler) markRunning(task *trainpilotv1alpha1.TrainTask, po
 		task.Status.SegmentStartedAt = timePtr(now)
 	}
 	task.Status.Segments = append(task.Status.Segments, trainpilotv1alpha1.RunSegment{
-		RunID:              task.Spec.RunID,
-		Round:              task.Status.Round,
-		StartedAt:          timePtr(now),
-		Workers:            task.Spec.Workers,
-		PricePerWorkerHour: task.Spec.PricePerWorkerHour,
+		RunID:     task.Spec.RunID,
+		Round:     task.Status.Round,
+		StartedAt: timePtr(now),
+		Workers:   task.Spec.Workers,
 	})
 	r.setCondition(task, ConditionWorkersReady, metav1.ConditionTrue, "AllRunning", "all workers are running")
 	_ = pods
 }
 
-// openSegmentFromPods bills a round the operator never saw as Running. The
+// openSegmentFromPods meters a round the operator never saw as Running. The
 // segment is backdated to the earliest worker start so a short round still
-// reports its billed time instead of zero.
+// reports its metered time instead of zero.
 func (r *TrainTaskReconciler) openSegmentFromPods(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod, now time.Time) {
 	if task.Status.SegmentStartedAt != nil || len(task.Status.Segments) > 0 {
 		return
@@ -603,15 +588,14 @@ func (r *TrainTaskReconciler) openSegmentFromPods(task *trainpilotv1alpha1.Train
 	}
 	task.Status.SegmentStartedAt = timePtr(start)
 	task.Status.Segments = append(task.Status.Segments, trainpilotv1alpha1.RunSegment{
-		RunID:              task.Spec.RunID,
-		Round:              task.Status.Round,
-		StartedAt:          timePtr(start),
-		Workers:            task.Spec.Workers,
-		PricePerWorkerHour: task.Spec.PricePerWorkerHour,
+		RunID:     task.Spec.RunID,
+		Round:     task.Status.Round,
+		StartedAt: timePtr(start),
+		Workers:   task.Spec.Workers,
 	})
 }
 
-// updateStartingStep maps pod state onto the PRD's starting sub-steps.
+// updateStartingStep maps pod state onto the starting sub-steps.
 func (r *TrainTaskReconciler) updateStartingStep(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod, now time.Time) {
 	step := trainpilotv1alpha1.StepAllocatingResources
 	for i := range pods {
@@ -663,8 +647,8 @@ func laterStep(cur, next string) string {
 }
 
 // detectStartupFailure returns a reason when the round cannot start: image pull
-// or config errors (PRD 7.7.4) or a startup that exceeds startupTimeout (7.7.5).
-func (r *TrainTaskReconciler) detectStartupFailure(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
+// or config errors, or a startup that exceeds startupTimeout.
+func (r *TrainTaskReconciler) detectStartupFailure(task *trainpilotv1alpha1.TrainTask,
 	pods []corev1.Pod, now time.Time) string {
 	for i := range pods {
 		for _, cs := range pods[i].Status.ContainerStatuses {
@@ -696,7 +680,7 @@ func (r *TrainTaskReconciler) detectStartupFailure(ctx context.Context, task *tr
 // detectWorkerFailure returns a reason when the round failed for infrastructure
 // reasons the TrainJob condition does not describe (node flapping, eviction).
 func (r *TrainTaskReconciler) detectWorkerFailure(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
-	round render.Round, pods []corev1.Pod) string {
+	pods []corev1.Pod) string {
 
 	for i := range pods {
 		p := &pods[i]
@@ -725,10 +709,8 @@ func (r *TrainTaskReconciler) detectWorkerFailure(ctx context.Context, task *tra
 
 // excludeNode records a bad node for the rest of the run, FIFO-evicting past the cap.
 func (r *TrainTaskReconciler) excludeNode(task *trainpilotv1alpha1.TrainTask, node string) {
-	for _, n := range task.Status.ExcludedNodes {
-		if n == node {
-			return
-		}
+	if slices.Contains(task.Status.ExcludedNodes, node) {
+		return
 	}
 	if len(task.Status.ExcludedNodes) >= maxExcludedNodes {
 		task.Status.ExcludedNodes = task.Status.ExcludedNodes[1:]
@@ -747,7 +729,7 @@ func nodeReady(n *corev1.Node) bool {
 	return false
 }
 
-// refreshWorkers mirrors pod placement into status (PRD 7.6 运行记录).
+// refreshWorkers mirrors pod placement into status (运行记录).
 func (r *TrainTaskReconciler) refreshWorkers(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod) {
 	workers := make([]trainpilotv1alpha1.WorkerPod, 0, len(pods))
 	for i := range pods {
@@ -763,8 +745,8 @@ func (r *TrainTaskReconciler) refreshWorkers(task *trainpilotv1alpha1.TrainTask,
 	task.Status.Workers = workers
 }
 
-// accrueBilling updates the open segment's billed seconds and cost.
-func (r *TrainTaskReconciler) accrueBilling(task *trainpilotv1alpha1.TrainTask, now time.Time) {
+// accrueMetering updates the open segment's metered seconds.
+func (r *TrainTaskReconciler) accrueMetering(task *trainpilotv1alpha1.TrainTask, now time.Time) {
 	start := task.Status.SegmentStartedAt
 	if start == nil {
 		return
@@ -776,16 +758,12 @@ func (r *TrainTaskReconciler) accrueBilling(task *trainpilotv1alpha1.TrainTask, 
 	if seg.EndedAt != nil {
 		return
 	}
-	seconds := int64(now.Sub(start.Time).Seconds())
-	if seconds < 0 {
-		seconds = 0
-	}
-	seg.BilledSeconds = seconds
-	seg.Amount = cost(seconds, seg.Workers, seg.PricePerWorkerHour)
-	r.recomputeTotals(task)
+	seconds := max(int64(now.Sub(start.Time).Seconds()), 0)
+	seg.MeteredSeconds = seconds
+	r.recomputeMetered(task)
 }
 
-// closeSegment ends the open billing segment.
+// closeSegment ends the open metered segment.
 func (r *TrainTaskReconciler) closeSegment(task *trainpilotv1alpha1.TrainTask, now time.Time, reason string) {
 	if task.Status.SegmentStartedAt == nil || len(task.Status.Segments) == 0 {
 		return
@@ -794,36 +772,21 @@ func (r *TrainTaskReconciler) closeSegment(task *trainpilotv1alpha1.TrainTask, n
 	if seg.EndedAt != nil {
 		return
 	}
-	seconds := int64(now.Sub(task.Status.SegmentStartedAt.Time).Seconds())
-	if seconds < 0 {
-		seconds = 0
-	}
-	seg.BilledSeconds = seconds
+	seconds := max(int64(now.Sub(task.Status.SegmentStartedAt.Time).Seconds()), 0)
+	seg.MeteredSeconds = seconds
 	seg.EndedAt = timePtr(now)
 	seg.EndReason = reason
-	seg.Amount = cost(seconds, seg.Workers, seg.PricePerWorkerHour)
-	r.recomputeTotals(task)
+	r.recomputeMetered(task)
 	task.Status.SegmentStartedAt = nil
 }
 
-// recomputeTotals refreshes billed seconds and cost from the segment history.
-func (r *TrainTaskReconciler) recomputeTotals(task *trainpilotv1alpha1.TrainTask) {
+// recomputeMetered refreshes accumulated metered seconds from the segment history.
+func (r *TrainTaskReconciler) recomputeMetered(task *trainpilotv1alpha1.TrainTask) {
 	var seconds int64
-	var amount float64
 	for i := range task.Status.Segments {
-		seconds += task.Status.Segments[i].BilledSeconds
-		amount += task.Status.Segments[i].Amount.ToFloat()
+		seconds += task.Status.Segments[i].MeteredSeconds
 	}
-	task.Status.BilledSeconds = seconds
-	task.Status.AccumulatedCost = trainpilotv1alpha1.MoneyFromFloat(amount)
-}
-
-func cost(seconds int64, workers int32, price trainpilotv1alpha1.Money) trainpilotv1alpha1.Money {
-	p := price.ToFloat()
-	if workers <= 0 || p <= 0 || seconds <= 0 {
-		return trainpilotv1alpha1.ZeroMoney
-	}
-	return trainpilotv1alpha1.MoneyFromFloat(float64(seconds) / 3600.0 * float64(workers) * p)
+	task.Status.MeteredSeconds = seconds
 }
 
 // trainJobOutcome extracts a terminal outcome from TrainJob conditions.
@@ -873,7 +836,7 @@ func (r *TrainTaskReconciler) applyAction(task *trainpilotv1alpha1.TrainTask) bo
 }
 
 // applyStatusAction applies the status half of a continue request (继续运行):
-// same RUN_ID, both budgets reset (PRD 7.5). Keyed on the action id so a
+// same RUN_ID, both budgets reset. Keyed on the action id so a
 // repeated annotation is applied once.
 func (r *TrainTaskReconciler) applyStatusAction(task *trainpilotv1alpha1.TrainTask) {
 	raw := task.Annotations[AnnotationAction]
@@ -896,7 +859,7 @@ func (r *TrainTaskReconciler) applyStatusAction(task *trainpilotv1alpha1.TrainTa
 	}
 }
 
-// admit is the whole-task gang admission check (PRD 7.7: 整任务成组调度).
+// admit is the whole-task gang admission check (整任务成组调度).
 // It is evaluated in FIFO order over every queued task in the namespace so two
 // tasks cannot each believe the same GPU is free.
 func (r *TrainTaskReconciler) admit(ctx context.Context, task *trainpilotv1alpha1.TrainTask) (bool, string, error) {
@@ -914,23 +877,17 @@ func (r *TrainTaskReconciler) admit(ctx context.Context, task *trainpilotv1alpha
 		return false, "", err
 	}
 	// Older tasks are considered first; ties fall back to name for determinism.
-	ordered := make([]trainpilotv1alpha1.TrainTask, 0, len(tasks.Items))
-	for i := range tasks.Items {
-		ordered = append(ordered, tasks.Items[i])
-	}
-	sort.Slice(ordered, func(i, j int) bool {
-		ti, tj := ordered[i].CreationTimestamp, ordered[j].CreationTimestamp
-		if ti.Equal(&tj) {
-			return ordered[i].Name < ordered[j].Name
+	ordered := slices.Clone(tasks.Items)
+	slices.SortFunc(ordered, func(a, b trainpilotv1alpha1.TrainTask) int {
+		if c := a.CreationTimestamp.Compare(b.CreationTimestamp.Time); c != 0 {
+			return c
 		}
-		return ti.Before(&tj)
+		return strings.Compare(a.Name, b.Name)
 	})
 
 	free := map[string]int32{}
-	for name, gpus := range nodes {
-		free[name] = gpus
-	}
-	freeOf := func(t *trainpilotv1alpha1.TrainTask) ([]string, error) {
+	maps.Copy(free, nodes)
+	freeOf := func(t *trainpilotv1alpha1.TrainTask) []string {
 		need := t.Spec.Resources.GPUsPerWorker
 		picked := make([]string, 0, t.Spec.Workers)
 		// Spread wide first: more nodes per task leaves better packing for the rest.
@@ -940,7 +897,7 @@ func (r *TrainTaskReconciler) admit(ctx context.Context, task *trainpilotv1alpha
 				candidates = append(candidates, n)
 			}
 		}
-		sort.Strings(candidates)
+		slices.Sort(candidates)
 		for _, n := range candidates {
 			if len(picked) == int(t.Spec.Workers) {
 				break
@@ -948,9 +905,9 @@ func (r *TrainTaskReconciler) admit(ctx context.Context, task *trainpilotv1alpha
 			picked = append(picked, n)
 		}
 		if len(picked) < int(t.Spec.Workers) {
-			return nil, nil
+			return nil
 		}
-		return picked, nil
+		return picked
 	}
 
 	for i := range ordered {
@@ -961,8 +918,8 @@ func (r *TrainTaskReconciler) admit(ctx context.Context, task *trainpilotv1alpha
 		if t.Spec.Resources.GPUsPerWorker == 0 {
 			continue
 		}
-		picked, err := freeOf(t)
-		if err != nil || picked == nil {
+		picked := freeOf(t)
+		if picked == nil {
 			if t.UID == task.UID {
 				return false, fmt.Sprintf("排队中：等待 %d 个节点，每节点 %d 张 GPU",
 					t.Spec.Workers, t.Spec.Resources.GPUsPerWorker), nil
@@ -1039,7 +996,7 @@ func (r *TrainTaskReconciler) event(task *trainpilotv1alpha1.TrainTask, eventTyp
 	if r.Recorder == nil {
 		return
 	}
-	r.Recorder.Event(task, eventType, reason, message)
+	r.Recorder.Eventf(task, nil, eventType, reason, "", "%s", message)
 }
 
 func (r *TrainTaskReconciler) now() time.Time {
@@ -1056,7 +1013,7 @@ func timePtr(t time.Time) *metav1.Time {
 
 // equalStatus compares the fields this controller owns, ignoring LastTransitionTime
 // churn caused by re-evaluation of unchanged conditions.
-func equalStatus(a, b *trainpilotv1alpha1.TrainTaskStatus, now time.Time) bool {
+func equalStatus(a, b *trainpilotv1alpha1.TrainTaskStatus) bool {
 	ac := append([]metav1.Condition{}, a.Conditions...)
 	bc := append([]metav1.Condition{}, b.Conditions...)
 	for i := range ac {
@@ -1079,7 +1036,7 @@ func equalStatus(a, b *trainpilotv1alpha1.TrainTaskStatus, now time.Time) bool {
 // SetupWithManager sets up the controller with the Manager.
 func (r *TrainTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorderFor("trainpilot")
+		r.Recorder = mgr.GetEventRecorder("trainpilot")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&trainpilotv1alpha1.TrainTask{}).
@@ -1098,8 +1055,8 @@ func (r *TrainTaskReconciler) mapJobSetToTask(ctx context.Context, obj client.Ob
 	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &tj); err != nil {
 		return nil
 	}
-	if taskName, ok := tj.Labels["trainpilot.wutz.dev/task"]; ok {
-		return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: ns, Name: taskName}}}
+	if taskName, ok := tj.Labels[taskLabel]; ok {
+		return []reconcile.Request{{Namespace: ns, Name: taskName}}
 	}
 	return nil
 }

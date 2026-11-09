@@ -487,6 +487,6 @@ Rules:
 - Type: Geist Sans for values, Geist Mono for labels, IDs, phase names and numbers.
 - Tables are the primary surface: 14px rows, 1px `hairline` separators, no zebra.
 - Phase is a 6px dot plus a mono label; never a colored pill or badge.
-- Billing numbers are mono and right-aligned; currency is `¥` with two decimals.
+- Metered durations are mono and right-aligned, e.g. `3h 12m`.
 - No gradients in the dashboard — the Vercel mesh gradient belongs to marketing only.
-- Light theme only, like the rest of the platform.
+- Light theme only.

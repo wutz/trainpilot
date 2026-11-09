@@ -79,7 +79,7 @@ func TestRestartsExhaustedFails(t *testing.T) {
 	tk.Status.StartedRound = 2
 	tk.Status.RestartCount = 1
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 		Status: trainerv1alpha1.TrainJobStatus{
 			Conditions: []metav1.Condition{{Type: trainerv1alpha1.TrainJobFailed, Status: metav1.ConditionTrue}},
 		},
@@ -105,7 +105,7 @@ func TestCompletedTrainJobSucceeds(t *testing.T) {
 	tk := task("done", 1, 0)
 	tk.Status.StartedRound = 2
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 		Status: trainerv1alpha1.TrainJobStatus{
 			Conditions: []metav1.Condition{{Type: trainerv1alpha1.TrainJobComplete, Status: metav1.ConditionTrue}},
 		},
@@ -125,7 +125,7 @@ func TestCompletedTrainJobSucceeds(t *testing.T) {
 
 // A round that starts and finishes between two polls is still Starting when the
 // TrainJob completes. It must reach Succeeded rather than requeue forever, and
-// the billed segment must be backdated to the workers' start.
+// the metered segment must be backdated to the workers' start.
 func TestCompletedTrainJobSucceedsFromStarting(t *testing.T) {
 	tk := task("fast", 2, 0)
 	tk.Status.StartedRound = 2
@@ -136,7 +136,7 @@ func TestCompletedTrainJobSucceedsFromStarting(t *testing.T) {
 	round := render.Round{RunID: 1, Round: 2}
 
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, round), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, round), Namespace: tk.Namespace,
 		Status: trainerv1alpha1.TrainJobStatus{
 			Conditions: []metav1.Condition{{Type: trainerv1alpha1.TrainJobComplete, Status: metav1.ConditionTrue}},
 		},
@@ -152,26 +152,25 @@ func TestCompletedTrainJobSucceedsFromStarting(t *testing.T) {
 	if got.Status.Phase != trainpilotv1alpha1.PhaseSucceeded {
 		t.Fatalf("phase = %q, want Succeeded", got.Status.Phase)
 	}
-	if got.Status.BilledSeconds != 90 {
-		t.Fatalf("billedSeconds = %d, want 90 (backdated to pod start)", got.Status.BilledSeconds)
+	if got.Status.MeteredSeconds != 90 {
+		t.Fatalf("meteredSeconds = %d, want 90 (backdated to pod start)", got.Status.MeteredSeconds)
 	}
 	if got.Status.RestartCount != 0 {
 		t.Fatal("a successful round must not spend restart budget")
 	}
 }
 
-// Billing is measured on segments; exceeding max runtime ends the run.
-func TestMaxRuntimeIsEnforcedOnBilledTime(t *testing.T) {
+// Metering is measured on segments; exceeding max runtime ends the run.
+func TestMaxRuntimeIsEnforcedOnMeteredTime(t *testing.T) {
 	tk := task("long-run", 2, 0)
 	tk.Spec.FaultTolerance.MaxRuntimeSeconds = 1800
 	tk.Status.StartedRound = 2
 	tk.Status.SegmentStartedAt = timePtr(fixedNow.Add(-time.Hour))
 	tk.Status.Segments = []trainpilotv1alpha1.RunSegment{{
 		RunID: 1, Round: 2, StartedAt: timePtr(fixedNow.Add(-time.Hour)),
-		Workers: 2, PricePerWorkerHour: "10.00",
-	}}
+		Workers: 2}}
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 	}
 	r, c := newReconciler(t, tk, tj)
 
@@ -184,12 +183,9 @@ func TestMaxRuntimeIsEnforcedOnBilledTime(t *testing.T) {
 	if got.Status.Reason != trainpilotv1alpha1.ReasonMaxRuntimeExceeded {
 		t.Fatalf("reason = %q", got.Status.Reason)
 	}
-	// 1h × 2 workers × ¥10/h.
-	if got.Status.BilledSeconds < 3600 {
-		t.Fatalf("billedSeconds = %d, want >= 3600", got.Status.BilledSeconds)
-	}
-	if got.Status.AccumulatedCost.String() != "20.00" {
-		t.Fatalf("cost = %s, want 20.00", got.Status.AccumulatedCost)
+	// One hour of metered time on two workers.
+	if got.Status.MeteredSeconds < 3600 {
+		t.Fatalf("meteredSeconds = %d, want >= 3600", got.Status.MeteredSeconds)
 	}
 	if got.Status.Segments[0].EndedAt == nil {
 		t.Fatal("the open segment must be closed")
@@ -197,7 +193,7 @@ func TestMaxRuntimeIsEnforcedOnBilledTime(t *testing.T) {
 }
 
 // Queue timeout interrupts a task that never got resources, and must not leave
-// a billed segment open.
+// a metered segment open.
 func TestQueueTimeoutInterrupts(t *testing.T) {
 	tk := task("no-capacity", 1, 8)
 	tk.Spec.FaultTolerance.QueueTimeoutSeconds = 3600
@@ -207,8 +203,7 @@ func TestQueueTimeoutInterrupts(t *testing.T) {
 	tk.Status.SegmentStartedAt = timePtr(fixedNow.Add(-2 * time.Hour))
 	tk.Status.Segments = []trainpilotv1alpha1.RunSegment{{
 		RunID: 1, Round: 1, StartedAt: timePtr(fixedNow.Add(-2 * time.Hour)),
-		Workers: 1, PricePerWorkerHour: "10.00",
-	}}
+		Workers: 1}}
 	r, c := newReconciler(t, tk, gpuNode("gn-a", 8))
 
 	reconcileOnce(t, r, tk.Name)
@@ -221,7 +216,7 @@ func TestQueueTimeoutInterrupts(t *testing.T) {
 		t.Fatalf("reason = %q", got.Status.Reason)
 	}
 	if got.Status.SegmentStartedAt != nil {
-		t.Fatal("queue timeout must close the open billing segment")
+		t.Fatal("queue timeout must close the open metering segment")
 	}
 	if got.Status.Segments[0].EndedAt == nil {
 		t.Fatal("the segment must be closed")
@@ -260,7 +255,7 @@ func TestNodeFailureExcludesNode(t *testing.T) {
 	tk.Status.StartedRound = 2
 	pod := workerPod(tk.Name, 2, "gn-gone")
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 	}
 	r, c := newReconciler(t, tk, pod, tj)
 
@@ -304,10 +299,9 @@ func TestStopReleasesWorkers(t *testing.T) {
 	tk.Status.SegmentStartedAt = timePtr(fixedNow.Add(-30 * time.Minute))
 	tk.Status.Segments = []trainpilotv1alpha1.RunSegment{{
 		RunID: 1, Round: 2, StartedAt: timePtr(fixedNow.Add(-30 * time.Minute)),
-		Workers: 1, PricePerWorkerHour: "10.00",
-	}}
+		Workers: 1}}
 	tj := &trainerv1alpha1.TrainJob{
-		ObjectMeta: metav1.ObjectMeta{Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace},
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
 	}
 	r, c := newReconciler(t, tk, tj)
 
@@ -318,10 +312,10 @@ func TestStopReleasesWorkers(t *testing.T) {
 		t.Fatalf("phase = %q, want Stopped", got.Status.Phase)
 	}
 	if got.Status.SegmentStartedAt != nil {
-		t.Fatal("stop must close the billing segment")
+		t.Fatal("stop must close the metering segment")
 	}
-	if got.Status.BilledSeconds != 1800 {
-		t.Fatalf("billedSeconds = %d, want 1800", got.Status.BilledSeconds)
+	if got.Status.MeteredSeconds != 1800 {
+		t.Fatalf("meteredSeconds = %d, want 1800", got.Status.MeteredSeconds)
 	}
 }
 
@@ -335,8 +329,7 @@ func TestRerunResetsRunState(t *testing.T) {
 	}
 	tk.Status.RestartCount = 2
 	tk.Status.ExcludedNodes = []string{"gn-a"}
-	tk.Status.BilledSeconds = 100
-	tk.Status.AccumulatedCost = trainpilotv1alpha1.MoneyFromFloat(5)
+	tk.Status.MeteredSeconds = 100
 	tk.Status.Phase = trainpilotv1alpha1.PhaseFailed
 	r, _ := newReconciler(t, tk)
 
@@ -352,7 +345,7 @@ func TestRerunResetsRunState(t *testing.T) {
 		t.Fatalf("action not marked applied: %q", got.Annotations[AnnotationActionApplied])
 	}
 	if got.Status.RunID != 2 || got.Status.RestartCount != 0 || len(got.Status.ExcludedNodes) != 0 ||
-		got.Status.BilledSeconds != 0 || got.Status.AccumulatedCost != trainpilotv1alpha1.ZeroMoney {
+		got.Status.MeteredSeconds != 0 {
 		t.Fatalf("run state not reset: %+v", got.Status)
 	}
 }
@@ -385,17 +378,15 @@ func TestContinueKeepsRunAndResetsBudgets(t *testing.T) {
 
 func workerPod(taskName string, round int32, node string) *corev1.Pod {
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      taskName + "-node-0-0",
-			Namespace: "trainpilot",
-			Labels: map[string]string{
-				"trainpilot.wutz.dev/task": taskName,
-				roundLabel:                 strconv.Itoa(int(round)),
-				render.TrainerNodeLabel:    "trainer",
-			},
-			Annotations: map[string]string{"batch.kubernetes.io/job-completion-index": "0"},
+		Name:      taskName + "-node-0-0",
+		Namespace: testNamespace,
+		Labels: map[string]string{
+			"trainpilot.wutz.dev/task": taskName,
+			roundLabel:                 strconv.Itoa(int(round)),
+			render.TrainerNodeLabel:    "trainer",
 		},
-		Spec:   corev1.PodSpec{NodeName: node},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		Annotations: map[string]string{"batch.kubernetes.io/job-completion-index": "0"},
+		Spec:        corev1.PodSpec{NodeName: node},
+		Status:      corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 }

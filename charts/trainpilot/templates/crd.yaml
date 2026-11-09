@@ -44,7 +44,7 @@ spec:
         description: |-
           TrainTask is the Schema for the traintasks API.
           It wraps a Kubeflow Trainer v2 TrainJob with queueing, automatic restart,
-          node exclusion and per-run-segment billing.
+          node exclusion and per-run-segment metering.
         properties:
           apiVersion:
             description: |-
@@ -68,8 +68,10 @@ spec:
             properties:
               command:
                 description: |-
-                  Command is the startup command. It is executed as `bash -c <command>`.
-                  Exit code 0 means success, anything else means failure (PRD 7.10).
+                  Command is the startup command. The lines are joined and run by the
+                  image's POSIX shell (`/bin/sh -c`), which re-executes it under `bash -lc`
+                  when the image provides bash. Images without any shell (distroless) are
+                  not supported. Exit code 0 means success, anything else means failure.
                 items:
                   type: string
                 minItems: 1
@@ -82,7 +84,7 @@ spec:
                 default: Running
                 description: |-
                   DesiredState stops or continues the task. Stopping releases workers and
-                  keeps RUN_ID; continuing resets both restart counters (PRD 7.5).
+                  keeps RUN_ID; continuing resets both restart counters.
                 enum:
                 - Running
                 - Stopped
@@ -280,7 +282,7 @@ spec:
                   maxRuntimeSeconds:
                     default: 604800
                     description: |-
-                      MaxRuntimeSeconds bounds the accumulated billed time of one run
+                      MaxRuntimeSeconds bounds the accumulated metered time of one run
                       (1-720 hours, default 168h).
                     format: int64
                     maximum: 2592000
@@ -296,8 +298,8 @@ spec:
                 type: object
               gpuType:
                 description: |-
-                  GPUType pins workers to nodes exposing this GPU type
-                  (node label `scclabs.dev/gpu`, e.g. rtx-5090).
+                  GPUType pins workers to nodes exposing this GPU type, matched against the
+                  type label configured with --gpu-node-label (e.g. a100, h100).
                 type: string
               image:
                 description: Image is the training container image.
@@ -308,14 +310,6 @@ spec:
                   type: string
                 description: NodeSelector is merged into the worker node selector.
                 type: object
-              pricePerWorkerHour:
-                default: "0.00"
-                description: |-
-                  PricePerWorkerHour is the spot price per worker in CNY/hour, used for
-                  cost display and segments (PRD 7.8). Serialized as a decimal string so
-                  the value survives JSON round-trips in every language.
-                pattern: ^[0-9]+(\.[0-9]{1,2})?$
-                type: string
               publicData:
                 description: PublicData is an optional read-only platform dataset
                   mount.
@@ -369,8 +363,7 @@ spec:
                 minimum: 1
                 type: integer
               sharedStorage:
-                description: SharedStorage is mounted read-write into every worker
-                  (PRD 7.3.7).
+                description: SharedStorage is mounted read-write into every worker.
                 items:
                   description: StorageMount mounts a PVC into every worker.
                   properties:
@@ -454,20 +447,11 @@ spec:
           status:
             description: TrainTaskStatus defines the observed state of TrainTask.
             properties:
-              accumulatedCost:
-                description: AccumulatedCost is the accumulated cost of the current
-                  run in CNY.
-                type: string
               appliedAction:
                 description: |-
                   AppliedAction records the last action id whose status-side effects were
                   applied, so a repeated request is honoured once.
                 type: string
-              billedSeconds:
-                description: BilledSeconds is the accumulated billed time of the current
-                  run.
-                format: int64
-                type: integer
               completionTime:
                 description: CompletionTime is when the task entered a terminal phase.
                 format: date-time
@@ -531,7 +515,7 @@ spec:
                 type: array
               excludedNodes:
                 description: ExcludedNodes lists nodes excluded for the rest of this
-                  run (PRD 7.7.7).
+                  run.
                 items:
                   type: string
                 type: array
@@ -546,6 +530,11 @@ spec:
               message:
                 description: Message explains the current phase or the terminal reason.
                 type: string
+              meteredSeconds:
+                description: MeteredSeconds is the accumulated metered time of the
+                  current run.
+                format: int64
+                type: integer
               observedGeneration:
                 description: ObservedGeneration is the last spec generation reconciled.
                 format: int64
@@ -580,25 +569,18 @@ spec:
                 format: int32
                 type: integer
               segmentStartedAt:
-                description: SegmentStartedAt is when the current billed segment started.
+                description: SegmentStartedAt is when the current metered segment
+                  started.
                 format: date-time
                 type: string
               segments:
-                description: Segments is the per-round billing history of the current
+                description: Segments is the per-round metering history of the current
                   run.
                 items:
                   description: |-
-                    RunSegment is one billed run segment (PRD 7.8.2): from the moment every worker
-                    is running to the moment the round ends.
+                    RunSegment is one metered run segment: from the moment every worker is running
+                    to the moment the round ends.
                   properties:
-                    amount:
-                      description: Amount is BilledSeconds × workers × price, rounded
-                        to cents.
-                      type: string
-                    billedSeconds:
-                      description: BilledSeconds is the billed duration of the segment.
-                      format: int64
-                      type: integer
                     endReason:
                       description: EndReason is one of the Reason* constants.
                       type: string
@@ -606,9 +588,10 @@ spec:
                       description: EndedAt is when the round ended.
                       format: date-time
                       type: string
-                    pricePerWorkerHour:
-                      description: PricePerWorkerHour is the price used for this segment.
-                      type: string
+                    meteredSeconds:
+                      description: MeteredSeconds is the metered duration of the segment.
+                      format: int64
+                      type: integer
                     round:
                       description: Round is the 1-based attempt index within the run.
                       format: int32
@@ -622,11 +605,12 @@ spec:
                       format: date-time
                       type: string
                     workers:
-                      description: Workers is the worker count used for pricing.
+                      description: Workers is the worker count the segment was metered
+                        at.
                       format: int32
                       type: integer
                   required:
-                  - billedSeconds
+                  - meteredSeconds
                   - round
                   - runID
                   type: object

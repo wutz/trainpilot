@@ -25,10 +25,10 @@ rbac:
 # Operator-wide render options, mirroring the manager flags.
 controller:
   # Node label carrying the accelerator type; used for node selection.
-  gpuNodeLabel: scclabs.dev/gpu
+  gpuNodeLabel: nvidia.com/gpu.product
   # Taint keys the worker pods tolerate, comma-separated.
-  gpuTolerationKeys: nvidia.com/gpu,scclabs.dev/vgpu
-  # Fraction of a worker's memory limit mounted as /dev/shm (PRD 7.3.5).
+  gpuTolerationKeys: nvidia.com/gpu
+  # Fraction of a worker's memory limit mounted as /dev/shm.
   sharedMemoryRatio: 0.5
   # ServiceAccount for worker pods; empty uses the namespace default.
   workerServiceAccount: ""

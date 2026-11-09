@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package ui serves the read-only TrainPilot dashboard: a table of TrainTasks
-// with phase, run/restart counters, worker placement and billed cost.
+// with phase, run/restart counters, worker placement and metered time.
 //
 // It is deliberately read-only. Every action (create, stop, continue, re-run)
 // goes through the Kubernetes API against the TrainTask resource, so the
@@ -29,7 +29,8 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -112,9 +113,7 @@ type taskView struct {
 	GPUsPerWorker   int32    `json:"gpusPerWorker"`
 	GPUType         string   `json:"gpuType"`
 	Image           string   `json:"image"`
-	BilledSeconds   int64    `json:"billedSeconds"`
-	AccumulatedCost string   `json:"accumulatedCost"`
-	PricePerWorker  string   `json:"pricePerWorkerHour"`
+	MeteredSeconds  int64    `json:"meteredSeconds"`
 	Nodes           []string `json:"nodes"`
 	ExcludedNodes   []string `json:"excludedNodes"`
 	StartedAt       string   `json:"startedAt,omitempty"`
@@ -159,9 +158,7 @@ func writeTasks(w http.ResponseWriter, r *http.Request, c client.Reader) {
 			GPUsPerWorker:   t.Spec.Resources.GPUsPerWorker,
 			GPUType:         t.Spec.GPUType,
 			Image:           t.Spec.Image,
-			BilledSeconds:   t.Status.BilledSeconds,
-			AccumulatedCost: t.Status.AccumulatedCost.String(),
-			PricePerWorker:  t.Spec.PricePerWorkerHour.String(),
+			MeteredSeconds:  t.Status.MeteredSeconds,
 			Nodes:           nodes,
 			ExcludedNodes:   t.Status.ExcludedNodes,
 			CreatedAt:       t.CreationTimestamp.UTC().Format(time.RFC3339),
@@ -178,7 +175,7 @@ func writeTasks(w http.ResponseWriter, r *http.Request, c client.Reader) {
 		}
 		views = append(views, v)
 	}
-	sort.Slice(views, func(i, j int) bool { return views[i].CreatedAt > views[j].CreatedAt })
+	slices.SortFunc(views, func(a, b taskView) int { return strings.Compare(b.CreatedAt, a.CreatedAt) })
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")

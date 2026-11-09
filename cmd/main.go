@@ -36,8 +36,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 	trainerv1alpha1 "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 
 	trainpilotv1alpha1 "github.com/wutz/trainpilot/api/v1alpha1"
 	"github.com/wutz/trainpilot/internal/controller"
@@ -99,12 +99,12 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.StringVar(&gpuLabel, "gpu-node-label", "scclabs.dev/gpu",
+	flag.StringVar(&gpuLabel, "gpu-node-label", "nvidia.com/gpu.product",
 		"Node label that carries the GPU type; used for node selection and gang admission.")
-	flag.StringVar(&gpuTolerationKeys, "gpu-toleration-keys", "nvidia.com/gpu,scclabs.dev/vgpu",
+	flag.StringVar(&gpuTolerationKeys, "gpu-toleration-keys", "nvidia.com/gpu",
 		"Comma-separated taint keys tolerated on GPU nodes.")
 	flag.Float64Var(&sharedMemoryRatio, "shared-memory-ratio", 0.5,
-		"Fraction of a worker's memory limit mounted as /dev/shm (PRD 7.3.5).")
+		"Fraction of a worker's memory limit mounted as /dev/shm.")
 	flag.StringVar(&workerServiceAccount, "worker-service-account", "",
 		"ServiceAccount name for worker pods; empty keeps the namespace default.")
 	flag.BoolVar(&enableWebhook, "enable-webhook", true,
@@ -257,7 +257,7 @@ func main() {
 // splitList parses a comma-separated flag value, dropping blanks.
 func splitList(v string) []string {
 	out := []string{}
-	for _, part := range strings.Split(v, ",") {
+	for part := range strings.SplitSeq(v, ",") {
 		if p := strings.TrimSpace(part); p != "" {
 			out = append(out, p)
 		}

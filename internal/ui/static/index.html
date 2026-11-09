@@ -110,7 +110,7 @@
           <th class="right">RUN / 轮次</th>
           <th class="right">重启 / 抢占</th>
           <th class="hide-sm">节点</th>
-          <th class="right">计费</th>
+          <th class="right">计量</th>
         </tr>
       </thead>
       <tbody id="rows">
@@ -154,13 +154,13 @@ function render(data) {
   const waiting = (counts.Queued || 0) + (counts.Starting || 0) + (counts.Recovering || 0);
   const gpus = tasks.filter(t => t.phase === "Running")
     .reduce((n, t) => n + t.workers * t.gpusPerWorker, 0);
-  const cost = tasks.reduce((n, t) => n + parseFloat(t.accumulatedCost || "0"), 0);
+  const metered = tasks.reduce((n, t) => n + (t.meteredSeconds || 0), 0);
 
   document.getElementById("summary").innerHTML = [
     ["运行中", running],
     ["等待 / 恢复", waiting],
     ["在用 GPU", gpus],
-    ["累计费用", "¥" + cost.toFixed(2)],
+    ["累计计量", duration(metered)],
   ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
 
   const updated = new Date(data.generatedAt);
@@ -192,8 +192,8 @@ function render(data) {
       <td class="num right">run ${t.runId}<div class="sub">第 ${t.round} 轮</div></td>
       <td class="num right">${t.restartCount}/${t.maxRestarts}<div class="sub">抢占 ${t.preemptionCount}/${t.maxPreemptions}</div></td>
       <td class="hide-sm"><div class="chips">${nodes}${excluded}</div></td>
-      <td class="num right">¥${esc(t.accumulatedCost)}
-        <div class="sub">${duration(t.billedSeconds)} · ¥${esc(t.pricePerWorkerHour)}/节点·时</div>
+      <td class="num right">${duration(t.meteredSeconds)}
+        <div class="sub">${t.workers} 节点</div>
       </td>
     </tr>`;
   }).join("");
