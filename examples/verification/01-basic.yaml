@@ -1,5 +1,5 @@
 # 最小路径：2 个 worker、无 GPU、正常退出。
-# 期望：Queued → Starting → Running → Succeeded，billedSeconds > 0，
+# 期望：Queued → Starting → Running → Succeeded，meteredSeconds > 0，
 # 两个 worker 分别拿到 NODE_RANK 0/1。
 apiVersion: trainpilot.wutz.dev/v1alpha1
 kind: TrainTask
@@ -21,7 +21,6 @@ spec:
   resources:
     cpu: "1"
     memory: 1Gi
-  pricePerWorkerHour: "2.00"
   faultTolerance:
     autoRestart: true
     maxRestarts: 3

@@ -39,7 +39,7 @@ func task(workers, gpus int32) *trainpilotv1alpha1.TrainTask {
 				CPU:           "16",
 				Memory:        "64Gi",
 			},
-			GPUType: "rtx-5090",
+			GPUType: "NVIDIA-A100-SXM4-80GB",
 		},
 	}
 }
@@ -99,7 +99,7 @@ func TestSharedMemoryIsHalfOfMemory(t *testing.T) {
 	if vol.EmptyDir.Medium != corev1.StorageMediumMemory {
 		t.Fatalf("dshm medium = %q", vol.EmptyDir.Medium)
 	}
-	// Worker memory is 64Gi, so /dev/shm must be 32Gi (PRD 7.3.5).
+	// Worker memory is 64Gi, so /dev/shm must be 32Gi (default /dev/shm ratio).
 	want := int64(64 * 1024 * 1024 * 1024 / 2)
 	if got := (*vol.EmptyDir.SizeLimit).Value(); got != want {
 		t.Fatalf("dshm size = %d, want %d", got, want)

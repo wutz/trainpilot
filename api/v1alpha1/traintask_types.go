@@ -17,17 +17,12 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"fmt"
-	"strconv"
-
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// TrainTaskPhase is the lifecycle phase of a TrainTask.
-//
-// The phase set follows PRD 7.4:
+// TrainTaskPhase is the lifecycle phase of a TrainTask:
 // Queued, Starting, Running, Recovering, Succeeded, Failed, Stopped, Interrupted.
 type TrainTaskPhase string
 
@@ -44,7 +39,7 @@ const (
 	PhaseSucceeded TrainTaskPhase = "Succeeded"
 	// PhaseFailed means the task will not be restarted, or max runtime was reached (失败).
 	PhaseFailed TrainTaskPhase = "Failed"
-	// PhaseStopped means the user stopped the task, or billing stopped it (已停止).
+	// PhaseStopped means the user stopped the task (已停止).
 	PhaseStopped TrainTaskPhase = "Stopped"
 	// PhaseInterrupted means the task was preempted or queue-timed-out and will not restart (已中断).
 	PhaseInterrupted TrainTaskPhase = "Interrupted"
@@ -60,7 +55,7 @@ const (
 	DesiredStateStopped DesiredState = "Stopped"
 )
 
-// End reasons recorded on a run segment and in status.message (PRD 7.4 / 7.8.3).
+// End reasons recorded on a run segment and in status.message.
 const (
 	ReasonSucceeded            = "Succeeded"
 	ReasonExitCode             = "ExitCode"
@@ -72,46 +67,16 @@ const (
 	ReasonPreemptionsExhausted = "PreemptionsExhausted"
 	ReasonQueueTimeout         = "QueueTimeout"
 	ReasonUserStopped          = "UserStopped"
-	ReasonAccountArrears       = "AccountArrears"
 	ReasonConfigChanged        = "ConfigChanged"
 )
 
-// Starting steps shown next to the Starting phase (PRD 7.4).
+// Starting steps shown next to the Starting phase.
 const (
 	StepAllocatingResources = "AllocatingResources"
 	StepPullingImage        = "PullingImage"
 	StepMountingStorage     = "MountingStorage"
 	StepStartingContainers  = "StartingContainers"
 )
-
-// Money is an amount in CNY with at most two decimal places, written as a string
-// (e.g. "12.34"). Kubernetes CRDs discourage floats, and money must not drift.
-type Money string
-
-// ZeroMoney is the canonical empty amount.
-const ZeroMoney Money = "0.00"
-
-// ToFloat converts to float64 for arithmetic. Invalid values read as zero.
-func (m Money) ToFloat() float64 {
-	f, err := strconv.ParseFloat(string(m), 64)
-	if err != nil || f < 0 {
-		return 0
-	}
-	return f
-}
-
-// String returns the amount in cents-free form, always with two decimals.
-func (m Money) String() string {
-	return fmt.Sprintf("%.2f", m.ToFloat())
-}
-
-// MoneyFromFloat formats a computed amount, rounding to cents.
-func MoneyFromFloat(f float64) Money {
-	if f <= 0 {
-		return ZeroMoney
-	}
-	return Money(fmt.Sprintf("%.2f", f))
-}
 
 // WorkerResources describes the per-worker compute shape.
 type WorkerResources struct {
@@ -147,7 +112,7 @@ type StorageMount struct {
 	SubPath string `json:"subPath,omitempty"`
 }
 
-// FaultTolerance captures the automatic restart configuration (PRD 7.3.2 / 7.7).
+// FaultTolerance captures the automatic restart configuration.
 type FaultTolerance struct {
 	// AutoRestart restarts the task after process failures, startup check failures
 	// and node failures.
@@ -173,7 +138,7 @@ type FaultTolerance struct {
 	// +kubebuilder:validation:Minimum=60
 	QueueTimeoutSeconds int64 `json:"queueTimeoutSeconds,omitempty"`
 
-	// MaxRuntimeSeconds bounds the accumulated billed time of one run
+	// MaxRuntimeSeconds bounds the accumulated metered time of one run
 	// (1-720 hours, default 168h).
 	// +kubebuilder:default=604800
 	// +kubebuilder:validation:Minimum=60
@@ -194,8 +159,7 @@ type TrainTaskSpec struct {
 	// Command is the startup command. The lines are joined and run by the
 	// image's POSIX shell (`/bin/sh -c`), which re-executes it under `bash -lc`
 	// when the image provides bash. Images without any shell (distroless) are
-	// not supported. Exit code 0 means success, anything else means failure
-	// (PRD 7.10).
+	// not supported. Exit code 0 means success, anything else means failure.
 	// +kubebuilder:validation:MinItems=1
 	Command []string `json:"command"`
 
@@ -209,8 +173,8 @@ type TrainTaskSpec struct {
 	// +kubebuilder:default={}
 	Resources WorkerResources `json:"resources,omitempty"`
 
-	// GPUType pins workers to nodes exposing this GPU type
-	// (node label `scclabs.dev/gpu`, e.g. rtx-5090).
+	// GPUType pins workers to nodes exposing this GPU type, matched against the
+	// type label configured with --gpu-node-label (e.g. a100, h100).
 	GPUType string `json:"gpuType,omitempty"`
 
 	// NodeSelector is merged into the worker node selector.
@@ -223,7 +187,7 @@ type TrainTaskSpec struct {
 	// (KEY / TOKEN / SECRET / PASS) are masked in the UI, not in the pod.
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
-	// SharedStorage is mounted read-write into every worker (PRD 7.3.7).
+	// SharedStorage is mounted read-write into every worker.
 	SharedStorage []StorageMount `json:"sharedStorage,omitempty"`
 
 	// PublicData is an optional read-only platform dataset mount.
@@ -233,15 +197,8 @@ type TrainTaskSpec struct {
 	// +kubebuilder:default={}
 	FaultTolerance FaultTolerance `json:"faultTolerance,omitempty"`
 
-	// PricePerWorkerHour is the spot price per worker in CNY/hour, used for
-	// cost display and segments (PRD 7.8). Serialized as a decimal string so
-	// the value survives JSON round-trips in every language.
-	// +kubebuilder:default="0.00"
-	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]{1,2})?$`
-	PricePerWorkerHour Money `json:"pricePerWorkerHour,omitempty"`
-
 	// DesiredState stops or continues the task. Stopping releases workers and
-	// keeps RUN_ID; continuing resets both restart counters (PRD 7.5).
+	// keeps RUN_ID; continuing resets both restart counters.
 	// +kubebuilder:default=Running
 	// +kubebuilder:validation:Enum=Running;Stopped
 	DesiredState DesiredState `json:"desiredState,omitempty"`
@@ -257,8 +214,8 @@ type TrainTaskSpec struct {
 	Suspend bool `json:"suspend,omitempty"`
 }
 
-// RunSegment is one billed run segment (PRD 7.8.2): from the moment every worker
-// is running to the moment the round ends.
+// RunSegment is one metered run segment: from the moment every worker is running
+// to the moment the round ends.
 type RunSegment struct {
 	// RunID is the run this segment belongs to.
 	RunID int32 `json:"runID"`
@@ -270,14 +227,10 @@ type RunSegment struct {
 	EndedAt *metav1.Time `json:"endedAt,omitempty"`
 	// EndReason is one of the Reason* constants.
 	EndReason string `json:"endReason,omitempty"`
-	// BilledSeconds is the billed duration of the segment.
-	BilledSeconds int64 `json:"billedSeconds"`
-	// Workers is the worker count used for pricing.
+	// MeteredSeconds is the metered duration of the segment.
+	MeteredSeconds int64 `json:"meteredSeconds"`
+	// Workers is the worker count the segment was metered at.
 	Workers int32 `json:"workers,omitempty"`
-	// PricePerWorkerHour is the price used for this segment.
-	PricePerWorkerHour Money `json:"pricePerWorkerHour,omitempty"`
-	// Amount is BilledSeconds × workers × price, rounded to cents.
-	Amount Money `json:"amount,omitempty"`
 }
 
 // WorkerPod reports one worker's placement.
@@ -326,7 +279,7 @@ type TrainTaskStatus struct {
 	MaxRestarts    int32 `json:"maxRestarts,omitempty"`
 	MaxPreemptions int32 `json:"maxPreemptions,omitempty"`
 
-	// ExcludedNodes lists nodes excluded for the rest of this run (PRD 7.7.7).
+	// ExcludedNodes lists nodes excluded for the rest of this run.
 	ExcludedNodes []string `json:"excludedNodes,omitempty"`
 
 	// AppliedAction records the last action id whose status-side effects were
@@ -336,16 +289,13 @@ type TrainTaskStatus struct {
 	// QueuedSince is when the current queue wait started.
 	QueuedSince *metav1.Time `json:"queuedSince,omitempty"`
 
-	// SegmentStartedAt is when the current billed segment started.
+	// SegmentStartedAt is when the current metered segment started.
 	SegmentStartedAt *metav1.Time `json:"segmentStartedAt,omitempty"`
 
-	// BilledSeconds is the accumulated billed time of the current run.
-	BilledSeconds int64 `json:"billedSeconds,omitempty"`
+	// MeteredSeconds is the accumulated metered time of the current run.
+	MeteredSeconds int64 `json:"meteredSeconds,omitempty"`
 
-	// AccumulatedCost is the accumulated cost of the current run in CNY.
-	AccumulatedCost Money `json:"accumulatedCost,omitempty"`
-
-	// Segments is the per-round billing history of the current run.
+	// Segments is the per-round metering history of the current run.
 	Segments []RunSegment `json:"segments,omitempty"`
 
 	// Workers reports the current worker placement.
@@ -375,7 +325,7 @@ type TrainTaskStatus struct {
 
 // TrainTask is the Schema for the traintasks API.
 // It wraps a Kubeflow Trainer v2 TrainJob with queueing, automatic restart,
-// node exclusion and per-run-segment billing.
+// node exclusion and per-run-segment metering.
 type TrainTask struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

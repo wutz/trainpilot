@@ -48,7 +48,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-// fixedNow keeps billing math deterministic.
+// fixedNow keeps metering math deterministic.
 var fixedNow = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
 func newReconciler(t *testing.T, objs ...client.Object) (*TrainTaskReconciler, client.Client) {
@@ -62,7 +62,7 @@ func newReconciler(t *testing.T, objs ...client.Object) (*TrainTaskReconciler, c
 	return &TrainTaskReconciler{
 		Client:            c,
 		Scheme:            s,
-		GPULabel:          "scclabs.dev/gpu",
+		GPULabel:          "nvidia.com/gpu.product",
 		GPUTolerationKeys: []string{"nvidia.com/gpu"},
 		SharedMemoryRatio: 0.5,
 		Now:               func() time.Time { return fixedNow },
@@ -99,14 +99,13 @@ func task(name string, workers, gpus int32) *trainpilotv1alpha1.TrainTask {
 			CreationTimestamp: metav1.NewTime(fixedNow.Add(-time.Hour)),
 		},
 		Spec: trainpilotv1alpha1.TrainTaskSpec{
-			Image:              "busybox:latest",
-			Command:            []string{"echo hello"},
-			Workers:            workers,
-			Resources:          trainpilotv1alpha1.WorkerResources{GPUsPerWorker: gpus, CPU: "4", Memory: "8Gi"},
-			PricePerWorkerHour: "10.00",
-			FaultTolerance:     trainpilotv1alpha1.FaultTolerance{AutoRestart: true, MaxRestarts: 3},
-			DesiredState:       trainpilotv1alpha1.DesiredStateRunning,
-			RunID:              1,
+			Image:          "busybox:latest",
+			Command:        []string{"echo hello"},
+			Workers:        workers,
+			Resources:      trainpilotv1alpha1.WorkerResources{GPUsPerWorker: gpus, CPU: "4", Memory: "8Gi"},
+			FaultTolerance: trainpilotv1alpha1.FaultTolerance{AutoRestart: true, MaxRestarts: 3},
+			DesiredState:   trainpilotv1alpha1.DesiredStateRunning,
+			RunID:          1,
 		},
 		Status: trainpilotv1alpha1.TrainTaskStatus{
 			RunID:   1,

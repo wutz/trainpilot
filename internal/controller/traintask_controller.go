@@ -71,14 +71,14 @@ const (
 
 	// queueRequeue is how often a queued task re-evaluates admission.
 	queueRequeue = 10 * time.Second
-	// runningRequeue is how often a running task refreshes billed seconds.
+	// runningRequeue is how often a running task refreshes metered seconds.
 	runningRequeue = 30 * time.Second
 	// startupTimeout bounds Starting before the round counts as a failed startup.
 	startupTimeout = 15 * time.Minute
 	// pendingGrace lets freshly created pods settle before they count as failures.
 	pendingGrace = 5 * time.Minute
 
-	// maxExcludedNodes is the PRD 7.7.7 cap on per-run exclusion.
+	// maxExcludedNodes is the cap on per-run node exclusion.
 	maxExcludedNodes = 8
 	// historyRounds is how many finished rounds are retained.
 	historyRounds = 3
@@ -203,9 +203,9 @@ func (r *TrainTaskReconciler) reconcile(ctx context.Context, task *trainpilotv1a
 	task.Status.Round = round.Round
 	task.Status.RunID = task.Spec.RunID
 
-	// Max runtime is measured on billed time (PRD 7.3.2 / 7.8), not wall clock.
-	r.accrueBilling(task, now)
-	if limit := task.Spec.FaultTolerance.MaxRuntimeSeconds; limit > 0 && task.Status.BilledSeconds >= limit {
+	// Max runtime is measured on metered time, not wall clock.
+	r.accrueMetering(task, now)
+	if limit := task.Spec.FaultTolerance.MaxRuntimeSeconds; limit > 0 && task.Status.MeteredSeconds >= limit {
 		r.endRun(ctx, task, now, trainpilotv1alpha1.ReasonMaxRuntimeExceeded)
 		return ctrl.Result{}, nil
 	}
@@ -236,9 +236,9 @@ func (r *TrainTaskReconciler) startOrQueue(ctx context.Context, task *trainpilot
 		task.Status.QueuedSince = timePtr(now)
 	}
 
-	// Queue timeout is per wait (PRD 7.7): exceed it and the task is interrupted.
+	// Queue timeout is per wait: exceed it and the task is interrupted.
 	// A timeout can also fire mid-restart, when the previous round was already
-	// billed, so close whatever segment is open and drop stale round objects.
+	// metered, so close whatever segment is open and drop stale round objects.
 	timeout := time.Duration(task.Spec.FaultTolerance.QueueTimeoutSeconds) * time.Second
 	if timeout > 0 && now.Sub(task.Status.QueuedSince.Time) > timeout {
 		r.stopRound(ctx, task, now, trainpilotv1alpha1.ReasonQueueTimeout)
@@ -313,7 +313,7 @@ func (r *TrainTaskReconciler) observeRound(ctx context.Context, task *trainpilot
 		return ctrl.Result{}, err
 	}
 
-	// PRD 7.4: Starting resolves into Running only when every worker runs.
+	// Starting resolves into Running only when every worker runs.
 	switch task.Status.Phase {
 	case trainpilotv1alpha1.PhaseQueued, "":
 		task.Status.Phase = trainpilotv1alpha1.PhaseStarting
@@ -350,11 +350,11 @@ func (r *TrainTaskReconciler) observeRound(ctx context.Context, task *trainpilot
 		return r.finishRound(ctx, task, round, now, failed, false)
 	}
 
-	r.accrueBilling(task, now)
+	r.accrueMetering(task, now)
 	return ctrl.Result{RequeueAfter: runningRequeue}, nil
 }
 
-// finishRound closes the segment, bills it and decides restart vs terminal.
+// finishRound closes the segment, meters it and decides restart vs terminal.
 func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
 	round render.Round, now time.Time, reason string, _ bool) (ctrl.Result, error) {
 
@@ -378,8 +378,8 @@ func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv
 	// requests counted against the next round's admission.
 	r.deleteRound(ctx, task, round)
 
-	// Classify: preemption spends the platform budget, everything else the
-	// user-facing restart budget (PRD 7.7.1 / 7.7.2).
+	// Classify: preemption spends the operator-side budget, everything else the
+	// user-facing restart budget.
 	if reason == trainpilotv1alpha1.ReasonPreempted {
 		task.Status.PreemptionCount++
 	} else {
@@ -447,7 +447,7 @@ func (r *TrainTaskReconciler) stopRound(ctx context.Context, task *trainpilotv1a
 	r.deleteRound(ctx, task, round)
 }
 
-// beginRun resets per-run state when spec.runID changes (PRD 7.5: 重跑).
+// beginRun resets per-run state when spec.runID changes (重跑).
 func (r *TrainTaskReconciler) beginRun(ctx context.Context, task *trainpilotv1alpha1.TrainTask, now time.Time) error {
 	oldRun := task.Status.RunID
 
@@ -482,8 +482,7 @@ func (r *TrainTaskReconciler) beginRun(ctx context.Context, task *trainpilotv1al
 	task.Status.RestartCount = 0
 	task.Status.PreemptionCount = 0
 	task.Status.ExcludedNodes = nil
-	task.Status.BilledSeconds = 0
-	task.Status.AccumulatedCost = trainpilotv1alpha1.ZeroMoney
+	task.Status.MeteredSeconds = 0
 	task.Status.Segments = nil
 	task.Status.Workers = nil
 	task.Status.StartedAt = nil
@@ -558,8 +557,8 @@ func podReady(p *corev1.Pod) bool {
 	return p.Status.Phase == corev1.PodRunning
 }
 
-// markRunning opens the billed segment (PRD 7.8.2: billing starts when every
-// worker is running).
+// markRunning opens the metered segment (metering starts when every worker is
+// running).
 func (r *TrainTaskReconciler) markRunning(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod, now time.Time) {
 	task.Status.Phase = trainpilotv1alpha1.PhaseRunning
 	task.Status.StartingStep = ""
@@ -572,19 +571,18 @@ func (r *TrainTaskReconciler) markRunning(task *trainpilotv1alpha1.TrainTask, po
 		task.Status.SegmentStartedAt = timePtr(now)
 	}
 	task.Status.Segments = append(task.Status.Segments, trainpilotv1alpha1.RunSegment{
-		RunID:              task.Spec.RunID,
-		Round:              task.Status.Round,
-		StartedAt:          timePtr(now),
-		Workers:            task.Spec.Workers,
-		PricePerWorkerHour: task.Spec.PricePerWorkerHour,
+		RunID:     task.Spec.RunID,
+		Round:     task.Status.Round,
+		StartedAt: timePtr(now),
+		Workers:   task.Spec.Workers,
 	})
 	r.setCondition(task, ConditionWorkersReady, metav1.ConditionTrue, "AllRunning", "all workers are running")
 	_ = pods
 }
 
-// openSegmentFromPods bills a round the operator never saw as Running. The
+// openSegmentFromPods meters a round the operator never saw as Running. The
 // segment is backdated to the earliest worker start so a short round still
-// reports its billed time instead of zero.
+// reports its metered time instead of zero.
 func (r *TrainTaskReconciler) openSegmentFromPods(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod, now time.Time) {
 	if task.Status.SegmentStartedAt != nil || len(task.Status.Segments) > 0 {
 		return
@@ -603,15 +601,14 @@ func (r *TrainTaskReconciler) openSegmentFromPods(task *trainpilotv1alpha1.Train
 	}
 	task.Status.SegmentStartedAt = timePtr(start)
 	task.Status.Segments = append(task.Status.Segments, trainpilotv1alpha1.RunSegment{
-		RunID:              task.Spec.RunID,
-		Round:              task.Status.Round,
-		StartedAt:          timePtr(start),
-		Workers:            task.Spec.Workers,
-		PricePerWorkerHour: task.Spec.PricePerWorkerHour,
+		RunID:     task.Spec.RunID,
+		Round:     task.Status.Round,
+		StartedAt: timePtr(start),
+		Workers:   task.Spec.Workers,
 	})
 }
 
-// updateStartingStep maps pod state onto the PRD's starting sub-steps.
+// updateStartingStep maps pod state onto the starting sub-steps.
 func (r *TrainTaskReconciler) updateStartingStep(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod, now time.Time) {
 	step := trainpilotv1alpha1.StepAllocatingResources
 	for i := range pods {
@@ -663,7 +660,7 @@ func laterStep(cur, next string) string {
 }
 
 // detectStartupFailure returns a reason when the round cannot start: image pull
-// or config errors (PRD 7.7.4) or a startup that exceeds startupTimeout (7.7.5).
+// or config errors, or a startup that exceeds startupTimeout.
 func (r *TrainTaskReconciler) detectStartupFailure(ctx context.Context, task *trainpilotv1alpha1.TrainTask,
 	pods []corev1.Pod, now time.Time) string {
 	for i := range pods {
@@ -747,7 +744,7 @@ func nodeReady(n *corev1.Node) bool {
 	return false
 }
 
-// refreshWorkers mirrors pod placement into status (PRD 7.6 运行记录).
+// refreshWorkers mirrors pod placement into status (运行记录).
 func (r *TrainTaskReconciler) refreshWorkers(task *trainpilotv1alpha1.TrainTask, pods []corev1.Pod) {
 	workers := make([]trainpilotv1alpha1.WorkerPod, 0, len(pods))
 	for i := range pods {
@@ -763,8 +760,8 @@ func (r *TrainTaskReconciler) refreshWorkers(task *trainpilotv1alpha1.TrainTask,
 	task.Status.Workers = workers
 }
 
-// accrueBilling updates the open segment's billed seconds and cost.
-func (r *TrainTaskReconciler) accrueBilling(task *trainpilotv1alpha1.TrainTask, now time.Time) {
+// accrueMetering updates the open segment's metered seconds.
+func (r *TrainTaskReconciler) accrueMetering(task *trainpilotv1alpha1.TrainTask, now time.Time) {
 	start := task.Status.SegmentStartedAt
 	if start == nil {
 		return
@@ -780,12 +777,11 @@ func (r *TrainTaskReconciler) accrueBilling(task *trainpilotv1alpha1.TrainTask, 
 	if seconds < 0 {
 		seconds = 0
 	}
-	seg.BilledSeconds = seconds
-	seg.Amount = cost(seconds, seg.Workers, seg.PricePerWorkerHour)
-	r.recomputeTotals(task)
+	seg.MeteredSeconds = seconds
+	r.recomputeMetered(task)
 }
 
-// closeSegment ends the open billing segment.
+// closeSegment ends the open metered segment.
 func (r *TrainTaskReconciler) closeSegment(task *trainpilotv1alpha1.TrainTask, now time.Time, reason string) {
 	if task.Status.SegmentStartedAt == nil || len(task.Status.Segments) == 0 {
 		return
@@ -798,32 +794,20 @@ func (r *TrainTaskReconciler) closeSegment(task *trainpilotv1alpha1.TrainTask, n
 	if seconds < 0 {
 		seconds = 0
 	}
-	seg.BilledSeconds = seconds
+	seg.MeteredSeconds = seconds
 	seg.EndedAt = timePtr(now)
 	seg.EndReason = reason
-	seg.Amount = cost(seconds, seg.Workers, seg.PricePerWorkerHour)
-	r.recomputeTotals(task)
+	r.recomputeMetered(task)
 	task.Status.SegmentStartedAt = nil
 }
 
-// recomputeTotals refreshes billed seconds and cost from the segment history.
-func (r *TrainTaskReconciler) recomputeTotals(task *trainpilotv1alpha1.TrainTask) {
+// recomputeMetered refreshes accumulated metered seconds from the segment history.
+func (r *TrainTaskReconciler) recomputeMetered(task *trainpilotv1alpha1.TrainTask) {
 	var seconds int64
-	var amount float64
 	for i := range task.Status.Segments {
-		seconds += task.Status.Segments[i].BilledSeconds
-		amount += task.Status.Segments[i].Amount.ToFloat()
+		seconds += task.Status.Segments[i].MeteredSeconds
 	}
-	task.Status.BilledSeconds = seconds
-	task.Status.AccumulatedCost = trainpilotv1alpha1.MoneyFromFloat(amount)
-}
-
-func cost(seconds int64, workers int32, price trainpilotv1alpha1.Money) trainpilotv1alpha1.Money {
-	p := price.ToFloat()
-	if workers <= 0 || p <= 0 || seconds <= 0 {
-		return trainpilotv1alpha1.ZeroMoney
-	}
-	return trainpilotv1alpha1.MoneyFromFloat(float64(seconds) / 3600.0 * float64(workers) * p)
+	task.Status.MeteredSeconds = seconds
 }
 
 // trainJobOutcome extracts a terminal outcome from TrainJob conditions.
@@ -873,7 +857,7 @@ func (r *TrainTaskReconciler) applyAction(task *trainpilotv1alpha1.TrainTask) bo
 }
 
 // applyStatusAction applies the status half of a continue request (继续运行):
-// same RUN_ID, both budgets reset (PRD 7.5). Keyed on the action id so a
+// same RUN_ID, both budgets reset. Keyed on the action id so a
 // repeated annotation is applied once.
 func (r *TrainTaskReconciler) applyStatusAction(task *trainpilotv1alpha1.TrainTask) {
 	raw := task.Annotations[AnnotationAction]
@@ -896,7 +880,7 @@ func (r *TrainTaskReconciler) applyStatusAction(task *trainpilotv1alpha1.TrainTa
 	}
 }
 
-// admit is the whole-task gang admission check (PRD 7.7: 整任务成组调度).
+// admit is the whole-task gang admission check (整任务成组调度).
 // It is evaluated in FIFO order over every queued task in the namespace so two
 // tasks cannot each believe the same GPU is free.
 func (r *TrainTaskReconciler) admit(ctx context.Context, task *trainpilotv1alpha1.TrainTask) (bool, string, error) {

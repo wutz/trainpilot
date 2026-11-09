@@ -1,5 +1,5 @@
 # Single node, 8 GPUs: proves the whole path — queueing, gang admission,
-# worker rendering, GPU/NCCL inside the container, billing and the dashboard.
+# worker rendering, GPU/NCCL inside the container, metering and the dashboard.
 apiVersion: trainpilot.wutz.dev/v1alpha1
 kind: TrainTask
 metadata:
@@ -14,17 +14,16 @@ spec:
       nvidia-smi -L
       /opt/nccl_tests/build/all_reduce_perf -b 8 -e 8G -f 2 -g 8
   workers: 1
-  gpuType: rtx-5090
+  gpuType: NVIDIA-A100-SXM4-80GB
   resources:
     gpusPerWorker: 8
     cpu: "32"
     memory: 128Gi
-  pricePerWorkerHour: "24.00"
   faultTolerance:
     autoRestart: true
     maxRestarts: 3
     maxRuntimeSeconds: 3600
   tolerations:
-    - key: scclabs.dev/vgpu
+    - key: nvidia.com/gpu
       operator: Exists
       effect: NoSchedule

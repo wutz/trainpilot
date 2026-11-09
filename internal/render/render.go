@@ -56,7 +56,7 @@ const (
 	GPUKey corev1.ResourceName = "nvidia.com/gpu"
 
 	// GPULabel is the default node label carrying the GPU type.
-	GPULabel = "scclabs.dev/gpu"
+	GPULabel = "nvidia.com/gpu.product"
 
 	// HostnameLabel is the standard hostname label used for anti-affinity and exclusion.
 	HostnameLabel = "kubernetes.io/hostname"
@@ -70,7 +70,7 @@ const (
 
 // Options carries operator-wide defaults injected into every rendered worker.
 type Options struct {
-	// GPULabel is the node label holding the GPU type (e.g. scclabs.dev/gpu).
+	// GPULabel is the node label holding the GPU type (e.g. nvidia.com/gpu.product).
 	GPULabel string
 	// GPUTolerationKeys are tolerated taint keys of GPU nodes.
 	GPUTolerationKeys []string
@@ -113,7 +113,7 @@ func MasterAddr(trainJobName string) string {
 }
 
 // RDMAEnabled reports whether the task gets host networking and an RDMA device
-// (PRD 7.3.5: multi-node tasks enable RDMA automatically when GPUs per worker >= 8;
+// (multi-node tasks enable RDMA automatically when GPUs per worker >= 8;
 // for multi-node with fewer GPUs, RDMA and hostNetwork are still enabled to support
 // cross-node communication, though RDMA hardware may not be utilized).
 func RDMAEnabled(spec *trainpilotv1alpha1.TrainTaskSpec) bool {
@@ -156,13 +156,13 @@ func TrainingRuntime(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) 
 			Template: trainerv1alpha1.JobSetTemplateSpec{
 				Spec: jobsetv1alpha2.JobSetSpec{
 					// A headless Service per JobSet gives every worker a stable
-					// DNS name, which is what MASTER_ADDR points at (PRD 7.2).
+					// DNS name, which is what MASTER_ADDR points at.
 					Network: &jobsetv1alpha2.Network{
 						EnableDNSHostnames:       ptr(true),
 						PublishNotReadyAddresses: ptr(true),
 					},
 					// JobSet must never restart a failed Job: the operator owns
-					// restart accounting (PRD 7.7) and starts a new round instead.
+					// restart accounting and starts a new round instead.
 					FailurePolicy: &jobsetv1alpha2.FailurePolicy{MaxRestarts: 0},
 					SuccessPolicy: &jobsetv1alpha2.SuccessPolicy{
 						Operator:             jobsetv1alpha2.OperatorAll,
@@ -192,8 +192,7 @@ func TrainingRuntime(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) 
 }
 
 // WorkerPodSpec builds the pod template: resources, /dev/shm, storage mounts,
-// RDMA, platform env and the anti-affinity / node-exclusion rules
-// (PRD 7.3.4-7.3.7, 7.7.7).
+// RDMA, injected env and the anti-affinity / node-exclusion rules.
 func WorkerPodSpec(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) corev1.PodSpec {
 	spec := &task.Spec
 	cpu := parseQuantity(spec.Resources.CPU, "8")
@@ -281,8 +280,8 @@ func containerCommand(script string) []string {
 	}
 }
 
-// platformEnv is PRD 7.3.1: the variables every worker receives. PET_* is added
-// by Trainer itself and deliberately not duplicated here.
+// platformEnv is the set of variables every worker receives. PET_* is added by
+// Trainer itself and deliberately not duplicated here.
 func platformEnv(task *trainpilotv1alpha1.TrainTask, r Round) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{Name: "TASK_ID", Value: task.Name},
@@ -292,7 +291,7 @@ func platformEnv(task *trainpilotv1alpha1.TrainTask, r Round) []corev1.EnvVar {
 		{Name: "MASTER_ADDR", Value: MasterAddr(Names(task.Name, r))},
 		{Name: "MASTER_PORT", Value: MASTERPort},
 		{
-			// Same source as PET_NODE_RANK, offered under the PRD name too.
+			// Same source as PET_NODE_RANK, offered under the task-wide name too.
 			Name: "NODE_RANK",
 			ValueFrom: &corev1.EnvVarSource{
 				FieldRef: &corev1.ObjectFieldSelector{
@@ -387,7 +386,7 @@ func nodeSelector(spec *trainpilotv1alpha1.TrainTaskSpec, opts Options) map[stri
 func tolerations(spec *trainpilotv1alpha1.TrainTaskSpec, opts Options) []corev1.Toleration {
 	keys := opts.GPUTolerationKeys
 	if len(keys) == 0 {
-		keys = []string{"nvidia.com/gpu", "scclabs.dev/vgpu"}
+		keys = []string{"nvidia.com/gpu"}
 	}
 	out := make([]corev1.Toleration, 0, len(keys)+len(spec.Tolerations))
 	for _, k := range keys {
@@ -401,8 +400,8 @@ func tolerations(spec *trainpilotv1alpha1.TrainTaskSpec, opts Options) []corev1.
 }
 
 // affinity spreads workers over distinct nodes and keeps them off nodes excluded
-// earlier in the same run (PRD 7.7.7). Hard anti-affinity guarantees the gang
-// occupies `workers` different nodes, which multi-node RDMA runs need.
+// earlier in the same run. Hard anti-affinity guarantees the gang occupies
+// `workers` different nodes, which multi-node RDMA runs need.
 func affinity(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) *corev1.Affinity {
 	a := &corev1.Affinity{}
 	if task.Spec.Workers > 1 {

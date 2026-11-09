@@ -1,6 +1,6 @@
 # TrainPilot Helm chart
 
-部署 TrainPilot（容器云训练任务 Operator）。依赖集群中已有的 **Kubeflow Trainer v2** 与
+部署 TrainPilot（训练任务 Operator）。依赖集群中已有的 **Kubeflow Trainer v2** 与
 **JobSet**；webhook 证书与入口证书默认由 **cert-manager** 签发。
 
 ```bash
@@ -19,8 +19,8 @@ helm install trainpilot oci://ghcr.io/wutz/trainpilot/charts/trainpilot \
 | `leaderElection` | bool | `true` | 开启 leader election |
 | `serviceAccount.create` | bool | `true` | 创建 ServiceAccount |
 | `rbac.create` | bool | `true` | 创建 ClusterRole/Binding 与 leader election Role |
-| `controller.gpuNodeLabel` | string | `scclabs.dev/gpu` | GPU 型号标签，用于节点选择 |
-| `controller.gpuTolerationKeys` | string | `nvidia.com/gpu,scclabs.dev/vgpu` | worker 容忍的污点 key（逗号分隔） |
+| `controller.gpuNodeLabel` | string | `nvidia.com/gpu.product` | GPU 型号标签，用于节点选择 |
+| `controller.gpuTolerationKeys` | string | `nvidia.com/gpu` | worker 容忍的污点 key（逗号分隔） |
 | `controller.sharedMemoryRatio` | float | `0.5` | `/dev/shm` 占内存上限比例 |
 | `controller.workerServiceAccount` | string | `""` | worker pod 使用的 ServiceAccount |
 | `controller.extraArgs` | list | `[]` | 追加的 manager 参数 |

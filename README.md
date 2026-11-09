@@ -1,12 +1,12 @@
 # TrainPilot
 
-容器云训练任务 Operator。TrainPilot 以 **Kubeflow Trainer v2** 为执行底座，在它之上补齐
-PRD 定义的平台语义：整任务成组排队、自动重启与抢占重排、节点隔离、按运行段落计费、
+训练任务 Operator。TrainPilot 以 **Kubeflow Trainer v2** 为执行底座，在它之上补齐
+训练平台需要的语义：整任务成组排队、自动重启与抢占重排、节点隔离、按运行段落计量、
 最长运行时长、停止/继续/重跑，以及一个只读看板。
 
 ```text
 TrainTask (trainpilot.wutz.dev/v1alpha1)
-   │  本仓库的 operator：排队 / 预算 / 计费 / 生命周期
+   │  本仓库的 operator：排队 / 预算 / 计量 / 生命周期
    ▼
 TrainingRuntime + TrainJob  (trainer.kubeflow.org/v1alpha1)
    │  Kubeflow Trainer 控制器
@@ -17,20 +17,20 @@ JobSet → Job → Pod(node × N)
 Operator 自己渲染每一轮的 `TrainingRuntime`（而不是复用它人写的 runtime），因此 pod 规格
 完全可控：`hostNetwork`、`rdma/hca`、`/dev/shm`、存储挂载、环境变量、亲和性与容忍都在
 模板里一次写清；`TrainJob` 只引用这一轮的 runtime。JobSet 的 `failurePolicy.maxRestarts`
-固定为 0 —— 重启账本归 operator 所有，平台从不自作主张重启。
+固定为 0 —— 重启账本归 operator 所有，operator 从不自作主张重启。
 
 ## 功能
 
-| PRD 语义 | 实现位置 |
+| 能力 | 实现位置 |
 | --- | --- |
 | 排队与整任务成组调度（同批次进出） | `internal/controller` `admit()`：按 `creationTimestamp` FIFO，计算每节点空闲 GPU 后整任务一次性放行 |
 | 排队超时（默认 24h） | `spec.faultTolerance.queueTimeoutSeconds` → `Interrupted/QueueTimeout` |
 | 自动重启（默认 10 次，1–100） | `restartCount` / `maxRestarts`，每轮新建 `TrainingRuntime`+`TrainJob`，RUN_ID 不变 |
-| 抢占重排（默认 40 次） | `preemptionCount`：平台删掉当前轮 `TrainJob` 即计一次，不消耗用户重启预算 |
+| 抢占重排（默认 40 次） | `preemptionCount`：operator 删掉当前轮 `TrainJob` 即计一次，不消耗用户重启预算 |
 | 节点故障隔离（≤8 台 FIFO） | `status.excludedNodes` → 下一轮 `nodeAffinity` 的 `hostname NotIn` |
 | 启动失败判定 | 镜像拉取/配置错误 + 15 分钟启动超时，均计入重启预算 |
-| 按段落计费 | `status.segments[]`：从所有 worker Running 到本轮结束，`元/小时 × workers` |
-| 最长运行时长（1–720h，默认 168h） | 按**计费时长**累计判定，超时 `Failed/MaxRuntimeExceeded` |
+| 按段落计量 | `status.segments[]`：从所有 worker Running 到本轮结束，记录该段时长与节点数 |
+| 最长运行时长（1–720h，默认 168h） | 按**计量时长**累计判定，超时 `Failed/MaxRuntimeExceeded` |
 | 停止 / 继续 / 重跑 | `spec.desiredState`，或注解 `trainpilot.wutz.dev/action=stop\|continue\|rerun=<id>` |
 | `/dev/shm` 为内存的 50% | `--shared-memory-ratio`（默认 0.5），Memory emptyDir 挂到 `/dev/shm` |
 | 多机 + 8 卡自动 RoCE | worker>1 且每 worker 8 卡时自动 `hostNetwork` + `rdma/hca: 1` + `ClusterFirstWithHostNet` |
@@ -58,8 +58,8 @@ helm install trainpilot oci://ghcr.io/wutz/trainpilot/charts/trainpilot \
 | --- | --- | --- |
 | `image.repository` / `image.tag` | `ghcr.io/wutz/trainpilot` / Chart appVersion | 控制器镜像 |
 | `replicaCount` | `2` | 多副本 + leader election，看板由所有副本提供 |
-| `controller.gpuNodeLabel` | `scclabs.dev/gpu` | GPU 型号所在的节点标签 |
-| `controller.gpuTolerationKeys` | `nvidia.com/gpu,scclabs.dev/vgpu` | worker 容忍的污点 key |
+| `controller.gpuNodeLabel` | `nvidia.com/gpu.product` | GPU 型号所在的节点标签 |
+| `controller.gpuTolerationKeys` | `nvidia.com/gpu` | worker 容忍的污点 key |
 | `controller.sharedMemoryRatio` | `0.5` | `/dev/shm` 占内存比例 |
 | `webhook.enabled` | `true` | TrainTask 校验（默认 `failurePolicy: Ignore`，不会阻塞创建） |
 | `ingress.host` / `ingress.tls` | `trainpilot.wutz.dev` / 自签 issuer | 看板入口 |
@@ -85,7 +85,6 @@ spec:
   command: ["echo hello from ${NODE_RANK}/${NNODES}"]
   workers: 2
   resources: { gpusPerWorker: 0, cpu: "2", memory: 4Gi }
-  pricePerWorkerHour: "1.50"
 ```
 
 操作：
@@ -117,7 +116,7 @@ Queued → Starting → Running → Succeeded
 - 终态为 `Succeeded` / `Failed` / `Stopped` / `Interrupted`；`continue` 可从终态续跑，
   `rerun` 让 `spec.runID` +1 重新开跑。
 
-只读看板：`/`（任务表、阶段、规模、重启/抢占、节点、计费），`/api/tasks`（同一份数据的 JSON），
+只读看板：`/`（任务表、阶段、规模、重启/抢占、节点、计量），`/api/tasks`（同一份数据的 JSON），
 `/healthz`。
 
 ## 开发
@@ -132,7 +131,7 @@ helm template tp charts/trainpilot --namespace trainpilot-system
 
 测试分两层：`internal/render` 校验渲染出的 pod/runtime 规格（RDMA、`/dev/shm`、环境变量、
 亲和性、存储、命令），`internal/controller` 用 fake client 跑状态机（抢占计数、预算耗尽、
-计费与最长运行时长、FIFO 准入、节点隔离、停止/继续/重跑）。
+计量与最长运行时长、FIFO 准入、节点隔离、停止/继续/重跑）。
 
 ## 许可
 
