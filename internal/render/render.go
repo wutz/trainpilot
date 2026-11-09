@@ -113,9 +113,11 @@ func MasterAddr(trainJobName string) string {
 }
 
 // RDMAEnabled reports whether the task gets host networking and an RDMA device
-// (PRD 7.3.5: multi-node tasks with 8 GPUs per worker enable RDMA automatically).
+// (PRD 7.3.5: multi-node tasks enable RDMA automatically when GPUs per worker >= 8;
+// for multi-node with fewer GPUs, RDMA and hostNetwork are still enabled to support
+// cross-node communication, though RDMA hardware may not be utilized).
 func RDMAEnabled(spec *trainpilotv1alpha1.TrainTaskSpec) bool {
-	return spec.Workers > 1 && spec.Resources.GPUsPerWorker >= 8
+	return spec.Workers > 1
 }
 
 // ObjectLabels are applied to every object the operator creates for a task.
