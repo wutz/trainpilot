@@ -48,6 +48,9 @@ spec:
             {{- if .Values.controller.workerServiceAccount }}
             - --worker-service-account={{ .Values.controller.workerServiceAccount }}
             {{- end }}
+            {{- if .Values.controller.defaultQueueName }}
+            - --default-queue-name={{ .Values.controller.defaultQueueName }}
+            {{- end }}
             {{- if .Values.metrics.enabled }}
             - --metrics-bind-address=:{{ .Values.metrics.port }}
             - --metrics-secure={{ .Values.metrics.secure }}

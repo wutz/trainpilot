@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -95,6 +94,11 @@ type TrainTaskReconciler struct {
 	GPUTolerationKeys  []string
 	SharedMemoryRatio  float64
 	ServiceAccountName string
+
+	// DefaultQueueName is the Kueue LocalQueue used when a TrainTask does not
+	// set spec.queueName. Empty means tasks are not queued through Kueue unless
+	// they name a queue themselves.
+	DefaultQueueName string
 
 	// Now is overridable for tests.
 	Now func() time.Time
@@ -229,61 +233,75 @@ func (r *TrainTaskReconciler) reconcile(ctx context.Context, task *trainpilotv1a
 	return r.observeRound(ctx, task, &tj, round, now)
 }
 
-// startOrQueue admits the round through the gang queue or leaves the task Queued.
+// startOrQueue creates the round's TrainJob and leaves the task Queued until
+// Kueue admits it.
 func (r *TrainTaskReconciler) startOrQueue(ctx context.Context, task *trainpilotv1alpha1.TrainTask, round render.Round, now time.Time) (ctrl.Result, error) {
 	if task.Status.QueuedSince == nil {
 		task.Status.QueuedSince = timePtr(now)
 	}
-
-	// Queue timeout is per wait: exceed it and the task is interrupted.
-	// A timeout can also fire mid-restart, when the previous round was already
-	// metered, so close whatever segment is open and drop stale round objects.
-	timeout := time.Duration(task.Spec.FaultTolerance.QueueTimeoutSeconds) * time.Second
-	if timeout > 0 && now.Sub(task.Status.QueuedSince.Time) > timeout {
-		r.stopRound(ctx, task, now, trainpilotv1alpha1.ReasonQueueTimeout)
-		task.Status.Phase = trainpilotv1alpha1.PhaseInterrupted
-		task.Status.Reason = trainpilotv1alpha1.ReasonQueueTimeout
-		task.Status.Message = "已中断：排队超时，未获得资源"
-		task.Status.CompletionTime = timePtr(now)
-		r.setCondition(task, ConditionQueued, metav1.ConditionFalse, trainpilotv1alpha1.ReasonQueueTimeout, "queue timeout")
-		r.event(task, corev1.EventTypeWarning, "QueueTimeout", "task waited longer than the queue timeout")
+	if r.queueExpired(ctx, task, now) {
 		return ctrl.Result{}, nil
 	}
 
-	admitted, reason, err := r.admit(ctx, task)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if !admitted {
-		task.Status.Phase = trainpilotv1alpha1.PhaseQueued
-		task.Status.Message = reason
-		r.setCondition(task, ConditionQueued, metav1.ConditionFalse, ConditionReasonNotAdmitted, reason)
-		r.event(task, corev1.EventTypeNormal, "Queued", reason)
-		return ctrl.Result{RequeueAfter: queueRequeue}, nil
-	}
-
+	// The TrainJob is created suspended. Kueue unsuspends it once the queue
+	// admits the whole job, which is the gang admission step.
 	if err := r.startRound(ctx, task, round); err != nil {
 		return ctrl.Result{}, err
 	}
-
-	task.Status.Phase = trainpilotv1alpha1.PhaseStarting
 	task.Status.StartedRound = round.Round
-	task.Status.StartingStep = trainpilotv1alpha1.StepAllocatingResources
-	task.Status.QueuedSince = nil
-	task.Status.Message = "启动中：资源已分配，正在创建 worker"
-	r.setCondition(task, ConditionQueued, metav1.ConditionTrue, ConditionReasonAdmitted, "admitted")
-	r.event(task, corev1.EventTypeNormal, "Started", fmt.Sprintf("round %d started with %d workers", round.Round, task.Spec.Workers))
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+
+	// Without a queue there is nothing to wait for: the TrainJob is created
+	// unsuspended and its workers start as soon as the scheduler places them.
+	if render.QueueName(task, r.renderOptions()) == "" {
+		task.Status.Phase = trainpilotv1alpha1.PhaseStarting
+		task.Status.QueuedSince = nil
+		task.Status.StartingSince = timePtr(now)
+		task.Status.Message = "启动中：等待 worker 调度"
+		r.setCondition(task, ConditionQueued, metav1.ConditionTrue, ConditionReasonAdmitted, "queueing disabled")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	task.Status.Phase = trainpilotv1alpha1.PhaseQueued
+	task.Status.Message = "排队中：等待 Kueue 准入"
+	r.setCondition(task, ConditionQueued, metav1.ConditionFalse, ConditionReasonNotAdmitted, "waiting for Kueue admission")
+	r.event(task, corev1.EventTypeNormal, "Queued", "TrainJob created suspended, waiting for Kueue admission")
+	return ctrl.Result{RequeueAfter: queueRequeue}, nil
 }
 
-// startRound renders the runtime and TrainJob for the round and creates them.
-func (r *TrainTaskReconciler) startRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask, round render.Round) error {
-	opts := render.Options{
+// renderOptions are the operator-wide values injected into every rendered object.
+func (r *TrainTaskReconciler) renderOptions() render.Options {
+	return render.Options{
 		GPULabel:           r.GPULabel,
 		GPUTolerationKeys:  r.GPUTolerationKeys,
 		SharedMemoryRatio:  r.SharedMemoryRatio,
 		ServiceAccountName: r.ServiceAccountName,
+		DefaultQueueName:   r.DefaultQueueName,
 	}
+}
+
+// queueExpired enforces the queue timeout and reports whether the task was
+// interrupted. It runs on every reconcile of a Queued task because a suspended
+// TrainJob can wait for as long as Kueue keeps it out of the queue.
+// A timeout can also fire mid-restart, when the previous round was already
+// metered, so it closes whatever segment is open and drops stale round objects.
+func (r *TrainTaskReconciler) queueExpired(ctx context.Context, task *trainpilotv1alpha1.TrainTask, now time.Time) bool {
+	timeout := time.Duration(task.Spec.FaultTolerance.QueueTimeoutSeconds) * time.Second
+	if timeout <= 0 || task.Status.QueuedSince == nil || now.Sub(task.Status.QueuedSince.Time) <= timeout {
+		return false
+	}
+	r.stopRound(ctx, task, now, trainpilotv1alpha1.ReasonQueueTimeout)
+	task.Status.Phase = trainpilotv1alpha1.PhaseInterrupted
+	task.Status.Reason = trainpilotv1alpha1.ReasonQueueTimeout
+	task.Status.Message = "已中断：排队超时，未获得资源"
+	task.Status.CompletionTime = timePtr(now)
+	r.setCondition(task, ConditionQueued, metav1.ConditionFalse, trainpilotv1alpha1.ReasonQueueTimeout, "queue timeout")
+	r.event(task, corev1.EventTypeWarning, "QueueTimeout", "task waited longer than the queue timeout")
+	return true
+}
+
+// startRound renders the runtime and TrainJob for the round and creates them.
+func (r *TrainTaskReconciler) startRound(ctx context.Context, task *trainpilotv1alpha1.TrainTask, round render.Round) error {
+	opts := r.renderOptions()
 
 	rt := render.TrainingRuntime(task, round, opts)
 	if err := controllerutil.SetControllerReference(task, rt, r.Scheme); err != nil {
@@ -293,7 +311,7 @@ func (r *TrainTaskReconciler) startRound(ctx context.Context, task *trainpilotv1
 		return fmt.Errorf("create training runtime: %w", err)
 	}
 
-	tj := render.TrainJob(task, round)
+	tj := render.TrainJob(task, round, opts)
 	if err := controllerutil.SetControllerReference(task, tj, r.Scheme); err != nil {
 		return err
 	}
@@ -312,11 +330,38 @@ func (r *TrainTaskReconciler) observeRound(ctx context.Context, task *trainpilot
 		return ctrl.Result{}, err
 	}
 
-	// Starting resolves into Running only when every worker runs.
-	switch task.Status.Phase {
-	case trainpilotv1alpha1.PhaseQueued, "":
+	// Queued resolves into Starting only after Kueue admits the round. A
+	// suspended TrainJob has no worker pods yet, so nothing is starting: keeping
+	// the task Queued keeps the queue timeout running and the startup timeout
+	// stopped.
+	if task.Status.Phase == trainpilotv1alpha1.PhaseQueued || task.Status.Phase == "" {
+		if suspended(tj) {
+			if task.Status.QueuedSince == nil {
+				task.Status.QueuedSince = timePtr(now)
+			}
+			if r.queueExpired(ctx, task, now) {
+				return ctrl.Result{}, nil
+			}
+			task.Status.Phase = trainpilotv1alpha1.PhaseQueued
+			task.Status.Message = "排队中：等待 Kueue 准入"
+			r.setCondition(task, ConditionQueued, metav1.ConditionFalse, ConditionReasonNotAdmitted, "waiting for Kueue admission")
+			return ctrl.Result{RequeueAfter: queueRequeue}, nil
+		}
 		task.Status.Phase = trainpilotv1alpha1.PhaseStarting
 		task.Status.QueuedSince = nil
+		if task.Status.StartingSince == nil {
+			task.Status.StartingSince = timePtr(now)
+		}
+		r.setCondition(task, ConditionQueued, metav1.ConditionTrue, ConditionReasonAdmitted, "admitted by Kueue")
+		r.event(task, corev1.EventTypeNormal, "Admitted", "Kueue admitted the TrainJob")
+	}
+
+	// Kueue re-suspends an admitted TrainJob to preempt it. The round lost its
+	// quota, which is a preemption, not a failure: it spends the preemption
+	// budget and the next round queues again.
+	if suspended(tj) {
+		r.event(task, corev1.EventTypeWarning, "Preempted", "Kueue suspended the TrainJob to reclaim its quota")
+		return r.finishRound(ctx, task, round, now, trainpilotv1alpha1.ReasonPreempted, false)
 	}
 
 	r.refreshWorkers(task, pods)
@@ -407,6 +452,7 @@ func (r *TrainTaskReconciler) finishRound(ctx context.Context, task *trainpilotv
 	task.Status.Round = round.Round + 1
 	task.Status.QueuedSince = timePtr(now.Add(backoff))
 	task.Status.StartingStep = ""
+	task.Status.StartingSince = nil
 	return ctrl.Result{RequeueAfter: backoff}, nil
 }
 
@@ -550,6 +596,7 @@ func (r *TrainTaskReconciler) markRunning(task *trainpilotv1alpha1.TrainTask, po
 	task.Status.Phase = trainpilotv1alpha1.PhaseRunning
 	task.Status.StartingStep = ""
 	task.Status.QueuedSince = nil
+	task.Status.StartingSince = nil
 	task.Status.Message = "运行中"
 	if task.Status.StartedAt == nil {
 		task.Status.StartedAt = timePtr(now)
@@ -665,7 +712,9 @@ func (r *TrainTaskReconciler) detectStartupFailure(task *trainpilotv1alpha1.Trai
 			}
 		}
 	}
-	if task.Status.QueuedSince != nil && now.Sub(task.Status.QueuedSince.Time) > startupTimeout {
+	// The startup clock starts at admission, not at enqueue: time spent waiting
+	// for Kueue must not count as a failed startup.
+	if task.Status.StartingSince != nil && now.Sub(task.Status.StartingSince.Time) > startupTimeout {
 		return trainpilotv1alpha1.ReasonStartupCheckFailed
 	}
 	// Starting is timestamped by the earliest pod; fall back to segment start.
@@ -789,6 +838,12 @@ func (r *TrainTaskReconciler) recomputeMetered(task *trainpilotv1alpha1.TrainTas
 	task.Status.MeteredSeconds = seconds
 }
 
+// suspended reports whether the TrainJob still waits for admission. Kueue owns
+// the field: it clears it on admission and sets it again on eviction.
+func suspended(tj *trainerv1alpha1.TrainJob) bool {
+	return tj.Spec.Suspend != nil && *tj.Spec.Suspend
+}
+
 // trainJobOutcome extracts a terminal outcome from TrainJob conditions.
 func trainJobOutcome(tj *trainerv1alpha1.TrainJob) (bool, string) {
 	for _, c := range tj.Status.Conditions {
@@ -856,128 +911,8 @@ func (r *TrainTaskReconciler) applyStatusAction(task *trainpilotv1alpha1.TrainTa
 		task.Status.Message = "排队中"
 		task.Status.CompletionTime = nil
 		task.Status.QueuedSince = nil
+		task.Status.StartingSince = nil
 	}
-}
-
-// admit is the whole-task gang admission check (整任务成组调度).
-// It is evaluated in FIFO order over every queued task in the namespace so two
-// tasks cannot each believe the same GPU is free.
-func (r *TrainTaskReconciler) admit(ctx context.Context, task *trainpilotv1alpha1.TrainTask) (bool, string, error) {
-	if task.Spec.Resources.GPUsPerWorker == 0 {
-		return true, "", nil
-	}
-
-	nodes, err := r.freeGPUNodes(ctx)
-	if err != nil {
-		return false, "", err
-	}
-
-	var tasks trainpilotv1alpha1.TrainTaskList
-	if err := r.List(ctx, &tasks, client.InNamespace(task.Namespace)); err != nil {
-		return false, "", err
-	}
-	// Older tasks are considered first; ties fall back to name for determinism.
-	ordered := slices.Clone(tasks.Items)
-	slices.SortFunc(ordered, func(a, b trainpilotv1alpha1.TrainTask) int {
-		if c := a.CreationTimestamp.Compare(b.CreationTimestamp.Time); c != 0 {
-			return c
-		}
-		return strings.Compare(a.Name, b.Name)
-	})
-
-	free := map[string]int32{}
-	maps.Copy(free, nodes)
-	freeOf := func(t *trainpilotv1alpha1.TrainTask) []string {
-		need := t.Spec.Resources.GPUsPerWorker
-		picked := make([]string, 0, t.Spec.Workers)
-		// Spread wide first: more nodes per task leaves better packing for the rest.
-		candidates := make([]string, 0, len(free))
-		for n := range free {
-			if free[n] >= need {
-				candidates = append(candidates, n)
-			}
-		}
-		slices.Sort(candidates)
-		for _, n := range candidates {
-			if len(picked) == int(t.Spec.Workers) {
-				break
-			}
-			picked = append(picked, n)
-		}
-		if len(picked) < int(t.Spec.Workers) {
-			return nil
-		}
-		return picked
-	}
-
-	for i := range ordered {
-		t := &ordered[i]
-		if !t.Spec.WantsRunning() || t.Status.Phase.IsTerminal() {
-			continue
-		}
-		if t.Spec.Resources.GPUsPerWorker == 0 {
-			continue
-		}
-		picked := freeOf(t)
-		if picked == nil {
-			if t.UID == task.UID {
-				return false, fmt.Sprintf("排队中：等待 %d 个节点，每节点 %d 张 GPU",
-					t.Spec.Workers, t.Spec.Resources.GPUsPerWorker), nil
-			}
-			continue
-		}
-		for _, n := range picked {
-			free[n] -= t.Spec.Resources.GPUsPerWorker
-		}
-		if t.UID == task.UID {
-			return true, "", nil
-		}
-	}
-	return false, "排队中：等待空闲 GPU 资源", nil
-}
-
-// freeGPUNodes returns allocatable minus requested GPUs per schedulable node.
-func (r *TrainTaskReconciler) freeGPUNodes(ctx context.Context) (map[string]int32, error) {
-	var nodes corev1.NodeList
-	if err := r.List(ctx, &nodes); err != nil {
-		return nil, err
-	}
-	free := map[string]int32{}
-	for i := range nodes.Items {
-		n := &nodes.Items[i]
-		if n.Spec.Unschedulable || !nodeReady(n) {
-			continue
-		}
-		alloc, ok := n.Status.Allocatable[render.GPUKey]
-		if !ok || alloc.IsZero() {
-			continue
-		}
-		free[n.Name] = int32(alloc.Value())
-	}
-
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods); err != nil {
-		return nil, err
-	}
-	for i := range pods.Items {
-		p := &pods.Items[i]
-		if p.Spec.NodeName == "" || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		var used int64
-		for _, c := range p.Spec.Containers {
-			if q, ok := c.Resources.Requests[render.GPUKey]; ok {
-				used += q.Value()
-			}
-		}
-		if used == 0 {
-			continue
-		}
-		if cur, ok := free[p.Spec.NodeName]; ok {
-			free[p.Spec.NodeName] = max(cur-int32(used), 0)
-		}
-	}
-	return free, nil
 }
 
 func (r *TrainTaskReconciler) setCondition(task *trainpilotv1alpha1.TrainTask, condType string,

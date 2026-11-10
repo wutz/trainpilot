@@ -14,7 +14,7 @@ kubectl -n $NS get traintask verify-basic -w
 | `02-restart.yaml` | 第一轮失败、第二轮成功 | 经历 `Recovering`，`restartCount=1`，`round=2`，最终 `Succeeded`，`runID` 不变 |
 | `03-budget.yaml` | 永远失败，`maxRestarts=2` | 3 轮后 `Failed`，`reason=RestartsExhausted`，`restartCount=3` |
 | `04-max-runtime.yaml` | 运行超过 120s | `Failed`，`reason=MaxRuntimeExceeded`，worker 被回收 |
-| `05-queue.yaml` | 4 个整机任务抢 3 台节点 | 前 3 个 `Running`，第 4 个 `Queued`；释放一个后第 4 个开始 |
+| `05-queue.yaml` | 3 个整机任务抢一个节点的 3 张卡（Kueue 准入） | 一个 `Running`，其余 `Queued`；释放后下一个被 Kueue 准入并开始。需先按 `examples/kueue/queues.yaml` 建好队列 |
 | `../nccl-single-node.yaml` | 单机 8 卡 NCCL | pod 日志出现 `Avg bus bandwidth`，任务 `Succeeded` |
 | `../nccl-multi-node.yaml` | 双机 16 卡跨节点 NCCL | 日志 `RESULT: OK (all 16 ranks agreed)` |
 

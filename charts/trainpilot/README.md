@@ -23,6 +23,7 @@ helm install trainpilot oci://ghcr.io/wutz/trainpilot/charts/trainpilot \
 | `controller.gpuTolerationKeys` | string | `nvidia.com/gpu` | worker 容忍的污点 key（逗号分隔） |
 | `controller.sharedMemoryRatio` | float | `0.5` | `/dev/shm` 占内存上限比例 |
 | `controller.workerServiceAccount` | string | `""` | worker pod 使用的 ServiceAccount |
+| `controller.defaultQueueName` | string | `""` | 默认 Kueue LocalQueue（由管理员创建）；留空表示不走 Kueue 排队 |
 | `controller.extraArgs` | list | `[]` | 追加的 manager 参数 |
 | `ui.enabled` | bool | `true` | 内嵌只读看板 |
 | `ui.port` | int | `8082` | 看板监听端口 |

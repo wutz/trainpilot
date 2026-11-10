@@ -17,12 +17,14 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"strconv"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	trainerv1alpha1 "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
 
@@ -132,7 +134,7 @@ func TestCompletedTrainJobSucceedsFromStarting(t *testing.T) {
 	tk.Status.Phase = trainpilotv1alpha1.PhaseStarting
 	tk.Status.Workers = nil
 	started := metav1.NewTime(fixedNow.Add(-90 * time.Second))
-	tk.Status.QueuedSince = &started
+	tk.Status.StartingSince = &started
 	round := render.Round{RunID: 1, Round: 2}
 
 	tj := &trainerv1alpha1.TrainJob{
@@ -223,29 +225,163 @@ func TestQueueTimeoutInterrupts(t *testing.T) {
 	}
 }
 
-// An eight-GPU worker needs whole nodes; the queue admits FIFO, so the older
-// task takes the only node and the newer one waits.
-func TestAdmissionIsFIFO(t *testing.T) {
-	older := task("older", 1, 8)
-	older.CreationTimestamp = metav1.NewTime(fixedNow.Add(-2 * time.Hour))
-	older.Status = trainpilotv1alpha1.TrainTaskStatus{RunID: 1, Round: 1, Phase: trainpilotv1alpha1.PhaseQueued}
-	newer := task("newer", 1, 8)
-	newer.CreationTimestamp = metav1.NewTime(fixedNow.Add(-time.Hour))
-	newer.Status = trainpilotv1alpha1.TrainTaskStatus{RunID: 1, Round: 1, Phase: trainpilotv1alpha1.PhaseQueued}
-
-	r, c := newReconciler(t, older, newer, gpuNode("gn-a", 8))
-
-	reconcileOnce(t, r, newer.Name)
-	if got := getTask(t, c, newer.Name); got.Status.Phase != trainpilotv1alpha1.PhaseQueued {
-		t.Fatalf("newer phase = %q, want Queued: the older task owns the node", got.Status.Phase)
+// A TrainJob Kueue has not admitted keeps the task Queued: the queue wait stays
+// open and the startup clock has not started.
+func TestSuspendedTrainJobKeepsTaskQueued(t *testing.T) {
+	tk := task("waiting", 2, 8)
+	tk.Status = trainpilotv1alpha1.TrainTaskStatus{
+		RunID: 1, Round: 1, StartedRound: 1,
+		Phase:       trainpilotv1alpha1.PhaseQueued,
+		QueuedSince: timePtr(fixedNow.Add(-10 * time.Minute)),
 	}
-
-	reconcileOnce(t, r, older.Name)
-	if got := getTask(t, c, older.Name); got.Status.Phase != trainpilotv1alpha1.PhaseStarting {
-		t.Fatalf("older phase = %q, want Starting", got.Status.Phase)
+	tj := &trainerv1alpha1.TrainJob{
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 1}), Namespace: tk.Namespace,
+		Spec: trainerv1alpha1.TrainJobSpec{Suspend: new(true)},
 	}
-	if got := getTask(t, c, older.Name); got.Status.StartedRound != 1 {
-		t.Fatalf("startedRound = %d, want 1", got.Status.StartedRound)
+	r, c := newReconciler(t, tk, tj)
+
+	res := reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Status.Phase != trainpilotv1alpha1.PhaseQueued {
+		t.Fatalf("phase = %q, want Queued while Kueue holds the TrainJob", got.Status.Phase)
+	}
+	if got.Status.QueuedSince == nil {
+		t.Fatal("the queue wait must stay open while the TrainJob is suspended")
+	}
+	if got.Status.StartingSince != nil {
+		t.Fatal("the startup clock must not start before admission")
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatal("a queued task must be requeued")
+	}
+}
+
+// A suspended round that waited past the queue timeout is interrupted, not
+// started.
+func TestSuspendedTrainJobTimesOut(t *testing.T) {
+	tk := task("no-quota", 2, 8)
+	tk.Spec.FaultTolerance.QueueTimeoutSeconds = 3600
+	tk.Status = trainpilotv1alpha1.TrainTaskStatus{
+		RunID: 1, Round: 1, StartedRound: 1,
+		Phase:       trainpilotv1alpha1.PhaseQueued,
+		QueuedSince: timePtr(fixedNow.Add(-2 * time.Hour)),
+	}
+	tj := &trainerv1alpha1.TrainJob{
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 1}), Namespace: tk.Namespace,
+		Spec: trainerv1alpha1.TrainJobSpec{Suspend: new(true)},
+	}
+	r, c := newReconciler(t, tk, tj)
+
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Status.Phase != trainpilotv1alpha1.PhaseInterrupted {
+		t.Fatalf("phase = %q, want Interrupted", got.Status.Phase)
+	}
+	if got.Status.Reason != trainpilotv1alpha1.ReasonQueueTimeout {
+		t.Fatalf("reason = %q", got.Status.Reason)
+	}
+}
+
+// Kueue re-suspends an admitted TrainJob to evict it: that is a preemption and
+// must not spend the user's restart budget.
+func TestKueueEvictionIsPreemption(t *testing.T) {
+	tk := task("evicted", 2, 8)
+	tk.Status.Round = 1
+	tk.Status.StartedRound = 1
+	tj := &trainerv1alpha1.TrainJob{
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 1}), Namespace: tk.Namespace,
+		Spec: trainerv1alpha1.TrainJobSpec{Suspend: new(true)},
+	}
+	r, c := newReconciler(t, tk, tj)
+
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Status.Phase != trainpilotv1alpha1.PhaseRecovering {
+		t.Fatalf("phase = %q, want Recovering", got.Status.Phase)
+	}
+	if got.Status.PreemptionCount != 1 || got.Status.RestartCount != 0 {
+		t.Fatalf("preemptions = %d, restarts = %d: eviction must only spend the preemption budget",
+			got.Status.PreemptionCount, got.Status.RestartCount)
+	}
+}
+
+// Once Kueue unsuspends the TrainJob the round starts and the queue wait ends.
+func TestAdmittedTrainJobStartsTask(t *testing.T) {
+	tk := task("admitted", 2, 8)
+	tk.Status = trainpilotv1alpha1.TrainTaskStatus{
+		RunID: 1, Round: 1, StartedRound: 1,
+		Phase:       trainpilotv1alpha1.PhaseQueued,
+		QueuedSince: timePtr(fixedNow.Add(-10 * time.Minute)),
+	}
+	tj := &trainerv1alpha1.TrainJob{
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 1}), Namespace: tk.Namespace,
+	}
+	r, c := newReconciler(t, tk, tj)
+
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Status.Phase != trainpilotv1alpha1.PhaseStarting {
+		t.Fatalf("phase = %q, want Starting after admission", got.Status.Phase)
+	}
+	if got.Status.QueuedSince != nil {
+		t.Fatal("admission must close the queue wait")
+	}
+	if got.Status.StartingSince == nil {
+		t.Fatal("admission must start the startup clock")
+	}
+}
+
+// Without a queue the TrainJob is created unsuspended and the round starts
+// right away.
+func TestNoQueueStartsWithoutKueue(t *testing.T) {
+	tk := task("direct", 1, 0)
+	tk.Status = trainpilotv1alpha1.TrainTaskStatus{RunID: 1, Round: 1, Phase: trainpilotv1alpha1.PhaseQueued}
+	r, c := newReconciler(t, tk)
+
+	reconcileOnce(t, r, tk.Name)
+
+	var tj trainerv1alpha1.TrainJob
+	name := render.Names(tk.Name, render.Round{RunID: 1, Round: 1})
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: name}, &tj); err != nil {
+		t.Fatalf("get trainjob: %v", err)
+	}
+	if tj.Spec.Suspend != nil && *tj.Spec.Suspend {
+		t.Fatal("without a queue the TrainJob must start unsuspended")
+	}
+	if _, ok := tj.Labels[render.QueueNameLabel]; ok {
+		t.Fatal("without a queue the TrainJob must not carry a Kueue queue label")
+	}
+	if got := getTask(t, c, tk.Name); got.Status.Phase != trainpilotv1alpha1.PhaseStarting {
+		t.Fatalf("phase = %q, want Starting", got.Status.Phase)
+	}
+}
+
+// With a queue configured the TrainJob waits suspended for Kueue.
+func TestQueuedTrainJobWaitsForKueue(t *testing.T) {
+	tk := task("queued", 1, 0)
+	tk.Spec.QueueName = "research"
+	tk.Status = trainpilotv1alpha1.TrainTaskStatus{RunID: 1, Round: 1, Phase: trainpilotv1alpha1.PhaseQueued}
+	r, c := newReconciler(t, tk)
+
+	reconcileOnce(t, r, tk.Name)
+
+	var tj trainerv1alpha1.TrainJob
+	name := render.Names(tk.Name, render.Round{RunID: 1, Round: 1})
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: name}, &tj); err != nil {
+		t.Fatalf("get trainjob: %v", err)
+	}
+	if tj.Labels[render.QueueNameLabel] != "research" {
+		t.Fatalf("queue label = %q, want research", tj.Labels[render.QueueNameLabel])
+	}
+	if tj.Spec.Suspend == nil || !*tj.Spec.Suspend {
+		t.Fatal("a queued TrainJob must be created suspended")
+	}
+	if got := getTask(t, c, tk.Name); got.Status.Phase != trainpilotv1alpha1.PhaseQueued {
+		t.Fatalf("phase = %q, want Queued", got.Status.Phase)
 	}
 }
 

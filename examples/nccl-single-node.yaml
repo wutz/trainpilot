@@ -1,5 +1,6 @@
-# Single node, 8 GPUs: proves the whole path — queueing, gang admission,
-# worker rendering, GPU/NCCL inside the container, metering and the dashboard.
+# Single node, 8 GPUs: proves the whole path — Kueue admission (when a queue is
+# configured), worker rendering, GPU/NCCL inside the container, metering and the
+# dashboard.
 apiVersion: trainpilot.wutz.dev/v1alpha1
 kind: TrainTask
 metadata:

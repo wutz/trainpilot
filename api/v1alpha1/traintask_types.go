@@ -212,6 +212,15 @@ type TrainTaskSpec struct {
 	// Suspend stops the underlying TrainJob without ending the task
 	// (equivalent to DesiredState=Stopped, kept for Jobs-style UX).
 	Suspend bool `json:"suspend,omitempty"`
+
+	// QueueName is the Kueue LocalQueue in this namespace that admits the task.
+	// It overrides the operator's default queue (--default-queue-name /
+	// Helm defaultQueueName). When neither is set the task is not queued
+	// through Kueue and its TrainJob starts unsuspended. Set it to the literal
+	// "none" to opt one task out while a default queue is configured.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^(none|[a-z0-9]([-a-z0-9]*[a-z0-9])?)$`
+	QueueName string `json:"queueName,omitempty"`
 }
 
 // RunSegment is one metered run segment: from the moment every worker is running
@@ -288,6 +297,11 @@ type TrainTaskStatus struct {
 
 	// QueuedSince is when the current queue wait started.
 	QueuedSince *metav1.Time `json:"queuedSince,omitempty"`
+
+	// StartingSince is when Kueue admitted the round and its workers began
+	// starting. It starts the startup timeout; time spent in the queue is not
+	// counted against it.
+	StartingSince *metav1.Time `json:"startingSince,omitempty"`
 
 	// SegmentStartedAt is when the current metered segment started.
 	SegmentStartedAt *metav1.Time `json:"segmentStartedAt,omitempty"`

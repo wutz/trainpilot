@@ -75,6 +75,7 @@ func main() {
 	var gpuTolerationKeys string
 	var sharedMemoryRatio float64
 	var workerServiceAccount string
+	var defaultQueueName string
 	var enableWebhook bool
 	var uiBindAddress string
 	var tlsOpts []func(*tls.Config)
@@ -100,13 +101,15 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.StringVar(&gpuLabel, "gpu-node-label", "nvidia.com/gpu.product",
-		"Node label that carries the GPU type; used for node selection and gang admission.")
+		"Node label that carries the GPU type; used for worker node selection.")
 	flag.StringVar(&gpuTolerationKeys, "gpu-toleration-keys", "nvidia.com/gpu",
 		"Comma-separated taint keys tolerated on GPU nodes.")
 	flag.Float64Var(&sharedMemoryRatio, "shared-memory-ratio", 0.5,
 		"Fraction of a worker's memory limit mounted as /dev/shm.")
 	flag.StringVar(&workerServiceAccount, "worker-service-account", "",
 		"ServiceAccount name for worker pods; empty keeps the namespace default.")
+	flag.StringVar(&defaultQueueName, "default-queue-name", "",
+		"Kueue LocalQueue that admits tasks which set no spec.queueName; empty disables queueing by default.")
 	flag.BoolVar(&enableWebhook, "enable-webhook", true,
 		"Serve TrainTask admission validation. Disable when the cluster cannot reach the webhook.")
 	opts := zap.Options{
@@ -216,6 +219,7 @@ func main() {
 		GPUTolerationKeys:  splitList(gpuTolerationKeys),
 		SharedMemoryRatio:  sharedMemoryRatio,
 		ServiceAccountName: workerServiceAccount,
+		DefaultQueueName:   defaultQueueName,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "traintask")
 		os.Exit(1)

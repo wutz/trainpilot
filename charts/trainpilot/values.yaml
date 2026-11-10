@@ -32,6 +32,11 @@ controller:
   sharedMemoryRatio: 0.5
   # ServiceAccount for worker pods; empty uses the namespace default.
   workerServiceAccount: ""
+  # Kueue LocalQueue that admits tasks which do not set spec.queueName.
+  # The LocalQueue and its ClusterQueue are created by the cluster admin, not by
+  # this chart. Empty means tasks are not queued through Kueue and their
+  # TrainJobs start unsuspended.
+  defaultQueueName: ""
   extraArgs: []
 
 # Read-only dashboard served by the manager itself over plain HTTP.
