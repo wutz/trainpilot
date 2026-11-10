@@ -1,7 +1,8 @@
 # 整任务成组排队：3 个任务各要 1 个 worker、每 worker 3 张 GPU。
-# 以一个 3 卡空闲节点为例（其余节点已被占满或被隔离）。
-# 期望：verify-queue-1 进入 Running，其余两个停在 Queued；
-# 删掉 verify-queue-1 后 verify-queue-2 立即开始。FIFO 顺序按创建时间，同一文件里按名称稳定。
+# 排队与准入交给 Kueue：先按 examples/kueue/queues.yaml 建好队列，并保证本命名空间有
+# 名为 gpu 的 LocalQueue（或把 queueName 改成实际名字）。
+# 期望：配额只够 3 张卡时 verify-queue-1 进入 Running，其余停在 Queued（等待 Kueue 准入）；
+# 删掉 verify-queue-1 腾出配额后，verify-queue-2 被准入并开始。顺序由 Kueue 的 FIFO 决定。
 apiVersion: trainpilot.wutz.dev/v1alpha1
 kind: TrainTask
 metadata:
@@ -10,6 +11,7 @@ spec:
   image: busybox:1.36
   command: ["echo holding 3 gpus; sleep 900"]
   workers: 1
+  queueName: gpu
   gpuType: NVIDIA-A100-SXM4-80GB
   resources:
     gpusPerWorker: 3
@@ -28,6 +30,7 @@ spec:
   image: busybox:1.36
   command: ["echo I had to wait; sleep 60"]
   workers: 1
+  queueName: gpu
   gpuType: NVIDIA-A100-SXM4-80GB
   resources:
     gpusPerWorker: 3
@@ -46,6 +49,7 @@ spec:
   image: busybox:1.36
   command: ["echo I had to wait too; sleep 60"]
   workers: 1
+  queueName: gpu
   gpuType: NVIDIA-A100-SXM4-80GB
   resources:
     gpusPerWorker: 3

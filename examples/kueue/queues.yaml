@@ -1,0 +1,42 @@
+# 队列与成组调度的参考配置，给集群管理员用。
+# TrainPilot 只引用队列名（spec.queueName 或 --default-queue-name），不创建下面这些对象。
+#
+# 1) ResourceFlavor 选中可用 GPU 的节点，nodeLabels 按集群实际标签调整。
+# 2) ClusterQueue 定义配额；配额定多少，就能同时放下多少张 GPU 的整任务。
+# 3) 每个命名空间一个 LocalQueue，TrainTask 用 spec.queueName 引用它。
+#
+# 配额放不下一个 TrainJob 的全部 worker 时，Kueue 不会部分放行 —— 这就是成组调度。
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: trainpilot-a100
+spec:
+  nodeLabels:
+    nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: trainpilot-gpu
+spec:
+  namespaceSelector: {}
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: trainpilot-a100
+          resources:
+            - name: cpu
+              nominalQuota: "256"
+            - name: memory
+              nominalQuota: 2000Gi
+            - name: nvidia.com/gpu
+              nominalQuota: "32"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: gpu
+  namespace: trainpilot-demo
+spec:
+  clusterQueue: trainpilot-gpu

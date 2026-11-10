@@ -203,6 +203,10 @@ func (in *TrainTaskStatus) DeepCopyInto(out *TrainTaskStatus) {
 		in, out := &in.QueuedSince, &out.QueuedSince
 		*out = (*in).DeepCopy()
 	}
+	if in.StartingSince != nil {
+		in, out := &in.StartingSince, &out.StartingSince
+		*out = (*in).DeepCopy()
+	}
 	if in.SegmentStartedAt != nil {
 		in, out := &in.SegmentStartedAt, &out.SegmentStartedAt
 		*out = (*in).DeepCopy()

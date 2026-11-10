@@ -57,6 +57,47 @@ func TestNamesStayWithinDNSLabel(t *testing.T) {
 	}
 }
 
+func TestTrainJobQueueNameAndSuspend(t *testing.T) {
+	const defaultQueue = "team-a"
+	round := Round{RunID: 1, Round: 1}
+
+	// No queue anywhere: the operator leaves scheduling alone.
+	tk := task(2, 8)
+	tj := TrainJob(tk, round, Options{})
+	if _, ok := tj.Labels[QueueNameLabel]; ok {
+		t.Fatal("an unqueued TrainJob must not carry a Kueue queue label")
+	}
+	if tj.Spec.Suspend != nil {
+		t.Fatal("an unqueued TrainJob must be created unsuspended")
+	}
+
+	// The operator default applies when the task names no queue.
+	tj = TrainJob(tk, round, Options{DefaultQueueName: defaultQueue})
+	if got := tj.Labels[QueueNameLabel]; got != defaultQueue {
+		t.Fatalf("queue label = %q, want %q", got, defaultQueue)
+	}
+	if tj.Spec.Suspend == nil || !*tj.Spec.Suspend {
+		t.Fatal("a queued TrainJob must be created suspended for Kueue")
+	}
+
+	// The task's own queue overrides the default.
+	tk.Spec.QueueName = "research"
+	tj = TrainJob(tk, round, Options{DefaultQueueName: defaultQueue})
+	if got := tj.Labels[QueueNameLabel]; got != "research" {
+		t.Fatalf("queue label = %q, want research", got)
+	}
+
+	// "none" opts a single task out even when a default queue exists.
+	tk.Spec.QueueName = NoQueue
+	tj = TrainJob(tk, round, Options{DefaultQueueName: defaultQueue})
+	if _, ok := tj.Labels[QueueNameLabel]; ok {
+		t.Fatal("queueName=none must not carry a Kueue queue label")
+	}
+	if tj.Spec.Suspend != nil {
+		t.Fatal("queueName=none must not suspend the TrainJob")
+	}
+}
+
 func TestMultiNodeEightGPUEnablesRDMA(t *testing.T) {
 	pod := WorkerPodSpec(task(2, 8), Round{RunID: 1, Round: 1}, Options{})
 	if !pod.HostNetwork {

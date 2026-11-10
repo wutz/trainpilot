@@ -1,14 +1,15 @@
 # TrainPilot
 
-训练任务 Operator。TrainPilot 以 **Kubeflow Trainer v2** 为执行底座，在它之上补齐
-训练平台需要的语义：整任务成组排队、自动重启与抢占重排、节点隔离、按运行段落计量、
-最长运行时长、停止/继续/重跑，以及一个只读看板。
+训练任务 Operator。TrainPilot 以 **Kubeflow Trainer v2** 为执行底座，把整任务排队与成组
+调度交给 **Kueue**，在两者之上补齐训练平台需要的语义：自动重启与抢占重排、节点隔离、
+按运行段落计量、最长运行时长、停止/继续/重跑，以及一个只读看板。
 
 ```text
 TrainTask (trainpilot.wutz.dev/v1alpha1)
-   │  本仓库的 operator：排队 / 预算 / 计量 / 生命周期
+   │  本仓库的 operator：预算 / 计量 / 生命周期；TrainJob 打队列标签并以 suspend 创建
    ▼
 TrainingRuntime + TrainJob  (trainer.kubeflow.org/v1alpha1)
+   │  Kueue：配额足够时整任务准入并 unsuspend；不装则直接调度
    │  Kubeflow Trainer 控制器
    ▼
 JobSet → Job → Pod(node × N)
@@ -23,12 +24,13 @@ Operator 自己渲染每一轮的 `TrainingRuntime`（而不是复用它人写�
 
 | 能力 | 实现位置 |
 | --- | --- |
-| 排队与整任务成组调度（同批次进出） | `internal/controller` `admit()`：按 `creationTimestamp` FIFO，计算每节点空闲 GPU 后整任务一次性放行 |
-| 排队超时（默认 24h） | `spec.faultTolerance.queueTimeoutSeconds` → `Interrupted/QueueTimeout` |
+| 排队与整任务成组调度（同批次进出） | 交给 Kueue：`TrainJob` 打 `kueue.x-k8s.io/queue-name` 标签并以 `spec.suspend: true` 创建，Kueue 在 LocalQueue 配额足够时整任务 unsuspend |
+| 队列选择 | 全局默认 `--default-queue-name`（Helm `controller.defaultQueueName`），单任务用 `spec.queueName` 覆盖；`none` 表示该任务跳过 Kueue，两者都为空则整站不走 Kueue |
+| 排队超时（默认 24h） | `spec.faultTolerance.queueTimeoutSeconds` → `Interrupted/QueueTimeout`；operator 删除仍挂起的 `TrainJob` |
 | 自动重启（默认 10 次，1–100） | `restartCount` / `maxRestarts`，每轮新建 `TrainingRuntime`+`TrainJob`，RUN_ID 不变 |
 | 抢占重排（默认 40 次） | `preemptionCount`：operator 删掉当前轮 `TrainJob` 即计一次，不消耗用户重启预算 |
 | 节点故障隔离（≤8 台 FIFO） | `status.excludedNodes` → 下一轮 `nodeAffinity` 的 `hostname NotIn` |
-| 启动失败判定 | 镜像拉取/配置错误 + 15 分钟启动超时，均计入重启预算 |
+| 启动失败判定 | 镜像拉取/配置错误 + 准入后 15 分钟启动超时（排队时长不计入），均计入重启预算 |
 | 按段落计量 | `status.segments[]`：从所有 worker Running 到本轮结束，记录该段时长与节点数 |
 | 最长运行时长（1–720h，默认 168h） | 按**计量时长**累计判定，超时 `Failed/MaxRuntimeExceeded` |
 | 停止 / 继续 / 重跑 | `spec.desiredState`，或注解 `trainpilot.wutz.dev/action=stop\|continue\|rerun=<id>` |
@@ -49,8 +51,10 @@ helm install trainpilot oci://ghcr.io/wutz/trainpilot/charts/trainpilot \
   --set ingress.host=trainpilot.wutz.dev
 ```
 
-前置条件只有一个：集群里已装好 **Kubeflow Trainer v2**（提供 `TrainingRuntime` /
-`TrainJob` CRD）与 **JobSet**。Kueue、Volcano 都不需要 —— 排队和成组调度由本 operator 完成。
+前置条件：集群里装好 **Kubeflow Trainer v2**（提供 `TrainingRuntime` / `TrainJob` CRD）
+与 **JobSet**。需要排队与成组调度时装 **Kueue** 并开启
+`trainer.kubeflow.org/trainjob` 集成（已在 Kueue v0.18 上验证）；不装 Kueue 也能用 ——
+任务的 `TrainJob` 直接以 unsuspended 创建，由调度器排队，但没有配额与整任务准入。
 
 主要 values：
 
@@ -61,9 +65,36 @@ helm install trainpilot oci://ghcr.io/wutz/trainpilot/charts/trainpilot \
 | `controller.gpuNodeLabel` | `nvidia.com/gpu.product` | GPU 型号所在的节点标签 |
 | `controller.gpuTolerationKeys` | `nvidia.com/gpu` | worker 容忍的污点 key |
 | `controller.sharedMemoryRatio` | `0.5` | `/dev/shm` 占内存比例 |
+| `controller.defaultQueueName` | `""` | 默认 Kueue LocalQueue；留空表示默认不走 Kueue |
 | `webhook.enabled` | `true` | TrainTask 校验（默认 `failurePolicy: Ignore`，不会阻塞创建） |
 | `ingress.host` / `ingress.tls` | `trainpilot.wutz.dev` / 自签 issuer | 看板入口 |
 | `crds.install` | `true` | 随 release 安装并升级 CRD |
+
+### 队列（Kueue）
+
+`ResourceFlavor` / `ClusterQueue` / `LocalQueue` 由集群管理员创建，本仓库不提供它们的模板 ——
+operator 只把队列名写进 `TrainJob` 的 `kueue.x-k8s.io/queue-name` 标签并以 suspend 创建，
+准入与成组放行由 Kueue 完成。管理员参考 `examples/kueue/queues.yaml`：
+
+```bash
+kubectl apply -f examples/kueue/queues.yaml
+```
+
+然后在任务里引用队列（或设全局默认 `--set controller.defaultQueueName=gpu`）：
+
+```yaml
+spec:
+  queueName: gpu   # 本命名空间里的 LocalQueue
+```
+
+- 全局默认与 `spec.queueName` 都为空：不走 Kueue，`TrainJob` 直接启动；
+- `spec.queueName` 覆盖全局默认，值 `none` 表示该任务跳过 Kueue；
+- 队列名必须是任务所在命名空间的 `LocalQueue`，写错时 Kueue 不会准入，任务停在 `Queued`
+  直到 `queueTimeoutSeconds` 超时（`Interrupted/QueueTimeout`）；
+- 配额放不下**整个** `TrainJob` 时不会部分放行 —— 这就是成组调度；
+- 准入后排队时长清零，`Starting` 的 15 分钟启动超时从准入开始计；
+- Kueue 抢占（把已准入的 `TrainJob` 重新 suspend）按**抢占**计：走抢占预算
+  （`maxPreemptions`），不消耗用户的重启预算，下一轮重新排队。
 
 ## 使用
 
@@ -111,6 +142,7 @@ Queued → Starting → Running → Succeeded
    └─────────┴──────────┴──→ Failed / Stopped / Interrupted
 ```
 
+- `Queued` 表示等待 Kueue 准入（`TrainJob` 处于 suspend）；准入后进入 `Starting`；
 - `Starting` 附带子步骤：`AllocatingResources` → `MountingStorage` → `PullingImage` → `StartingContainers`；
 - `Recovering` 表示本轮已结束、等待下一轮（启动退避最长 60s），`status.round` 自增；
 - 终态为 `Succeeded` / `Failed` / `Stopped` / `Interrupted`；`continue` 可从终态续跑，

@@ -1,5 +1,4 @@
 {{- if .Values.crds.install }}
----
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -333,6 +332,16 @@ spec:
                 - claimName
                 - mountPath
                 type: object
+              queueName:
+                description: |-
+                  QueueName is the Kueue LocalQueue in this namespace that admits the task.
+                  It overrides the operator's default queue (--default-queue-name /
+                  Helm defaultQueueName). When neither is set the task is not queued
+                  through Kueue and its TrainJob starts unsuspended. Set it to the literal
+                  "none" to opt one task out while a default queue is configured.
+                maxLength: 63
+                pattern: ^(none|[a-z0-9]([-a-z0-9]*[a-z0-9])?)$
+                type: string
               resources:
                 default: {}
                 description: Resources is the per-worker compute shape.
@@ -626,6 +635,13 @@ spec:
                   It lets the operator tell its own deletions from platform preemption.
                 format: int32
                 type: integer
+              startingSince:
+                description: |-
+                  StartingSince is when Kueue admitted the round and its workers began
+                  starting. It starts the startup timeout; time spent in the queue is not
+                  counted against it.
+                format: date-time
+                type: string
               startingStep:
                 description: StartingStep is the current step while Phase=Starting.
                 type: string

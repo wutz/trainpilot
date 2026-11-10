@@ -67,6 +67,13 @@ const (
 
 	// InstanceLabel groups all pods of one task across rounds.
 	InstanceLabel = "app.kubernetes.io/instance"
+
+	// QueueNameLabel is the label Kueue reads to place a workload in a LocalQueue.
+	QueueNameLabel = "kueue.x-k8s.io/queue-name"
+
+	// NoQueue is the spec.queueName value that opts a single task out of Kueue
+	// queueing even when the operator sets a default queue.
+	NoQueue = "none"
 )
 
 // Options carries operator-wide defaults injected into every rendered worker.
@@ -79,6 +86,22 @@ type Options struct {
 	SharedMemoryRatio float64
 	// ServiceAccountName is set on worker pods when non-empty.
 	ServiceAccountName string
+	// DefaultQueueName is the Kueue LocalQueue used when a task sets none.
+	// Empty means tasks are not queued through Kueue unless they name a queue.
+	DefaultQueueName string
+}
+
+// QueueName returns the Kueue LocalQueue a task is queued through, or "" when
+// queueing is disabled for it. The task's own spec wins over the default.
+func QueueName(task *trainpilotv1alpha1.TrainTask, opts Options) string {
+	name := task.Spec.QueueName
+	if name == "" {
+		name = opts.DefaultQueueName
+	}
+	if name == NoQueue {
+		return ""
+	}
+	return name
 }
 
 // Round carries the values that vary per attempt.
@@ -436,13 +459,15 @@ func affinity(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) *corev1
 // TrainJob renders the TrainJob that hands the round to the Trainer controller.
 // The node count comes from the runtime's mlPolicy.numNodes; Trainer keeps the
 // Job's parallelism/completions in sync with it.
-func TrainJob(task *trainpilotv1alpha1.TrainTask, r Round) *trainerv1alpha1.TrainJob {
+func TrainJob(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) *trainerv1alpha1.TrainJob {
 	name := Names(task.Name, r)
 	numNodes := task.Spec.Workers
-	return &trainerv1alpha1.TrainJob{
+	labels := ObjectLabels(task.Name, r)
+
+	tj := &trainerv1alpha1.TrainJob{
 		Name:      name,
 		Namespace: task.Namespace,
-		Labels:    ObjectLabels(task.Name, r),
+		Labels:    labels,
 		Spec: trainerv1alpha1.TrainJobSpec{
 			RuntimeRef: trainerv1alpha1.RuntimeRef{
 				Name:     name,
@@ -455,6 +480,15 @@ func TrainJob(task *trainpilotv1alpha1.TrainTask, r Round) *trainerv1alpha1.Trai
 			},
 		},
 	}
+
+	// Kueue admits the whole gang at once: the TrainJob is created suspended and
+	// Kueue unsuspends it when the LocalQueue has quota for every worker. Without
+	// a queue the TrainJob starts immediately and scheduling is the scheduler's.
+	if queue := QueueName(task, opts); queue != "" {
+		labels[QueueNameLabel] = queue
+		tj.Spec.Suspend = new(true)
+	}
+	return tj
 }
 
 func gpuLabel(opts Options) string {
