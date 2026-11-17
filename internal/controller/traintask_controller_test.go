@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -524,5 +525,248 @@ func workerPod(taskName string, round int32, node string) *corev1.Pod {
 		Annotations: map[string]string{"batch.kubernetes.io/job-completion-index": "0"},
 		Spec:        corev1.PodSpec{NodeName: node},
 		Status:      corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func TestStopActionAnnotationStopsTask(t *testing.T) {
+	tk := task("action-stop", 1, 0)
+	tk.Annotations = map[string]string{AnnotationAction: "stop=s1"}
+	r, c := newReconciler(t, tk)
+
+	reconcileOnce(t, r, tk.Name)
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Spec.DesiredState != trainpilotv1alpha1.DesiredStateStopped {
+		t.Fatalf("desiredState = %q, want Stopped", got.Spec.DesiredState)
+	}
+	if got.Status.Phase != trainpilotv1alpha1.PhaseStopped {
+		t.Fatalf("phase = %q, want Stopped", got.Status.Phase)
+	}
+	if got.Annotations[AnnotationActionApplied] != "stop=s1" {
+		t.Fatalf("applied-action = %q", got.Annotations[AnnotationActionApplied])
+	}
+}
+
+func TestResumeFromStoppedWithoutAction(t *testing.T) {
+	tk := task("resume-stopped", 1, 0)
+	tk.Spec.DesiredState = trainpilotv1alpha1.DesiredStateRunning
+	tk.Status.Phase = trainpilotv1alpha1.PhaseStopped
+	tk.Status.Reason = trainpilotv1alpha1.ReasonUserStopped
+	tk.Status.CompletionTime = timePtr(fixedNow.Add(-time.Minute))
+	r, c := newReconciler(t, tk)
+
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Status.Phase == trainpilotv1alpha1.PhaseStopped {
+		t.Fatal("task must resume when desiredState returns to Running")
+	}
+	if got.Status.Round != 3 {
+		t.Fatalf("round = %d, want 3", got.Status.Round)
+	}
+	if got.Status.CompletionTime != nil {
+		t.Fatal("resuming from Stopped must clear completionTime")
+	}
+}
+
+func TestContinueFromSucceededBumpsRound(t *testing.T) {
+	tk := task("cont-ok", 1, 0)
+	tk.Annotations = map[string]string{AnnotationAction: "continue=c1"}
+	tk.Status.Phase = trainpilotv1alpha1.PhaseSucceeded
+	tk.Status.Round = 2
+	tk.Status.CompletionTime = timePtr(fixedNow.Add(-time.Minute))
+	r, c := newReconciler(t, tk)
+
+	reconcileOnce(t, r, tk.Name)
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Status.Round != 3 {
+		t.Fatalf("round = %d, want 3 so next round does not collide with completed TrainJob", got.Status.Round)
+	}
+	if got.Status.Phase == trainpilotv1alpha1.PhaseSucceeded {
+		t.Fatal("continue must un-terminate Succeeded task")
+	}
+}
+
+func TestRecoveringRespectsNextRoundAfterBackoff(t *testing.T) {
+	tk := task("backoff", 1, 0)
+	tk.Status.Phase = trainpilotv1alpha1.PhaseRecovering
+	tk.Status.Round = 2
+	tk.Status.StartedRound = 0
+	tk.Status.NextRoundAfter = timePtr(fixedNow.Add(30 * time.Second))
+
+	now := fixedNow
+	r, c := newReconciler(t, tk)
+	r.Now = func() time.Time { return now }
+
+	res := reconcileOnce(t, r, tk.Name)
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("expected positive RequeueAfter while in backoff, got %v", res.RequeueAfter)
+	}
+	var tj trainerv1alpha1.TrainJob
+	name := render.Names(tk.Name, render.Round{RunID: 1, Round: 2})
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: name}, &tj); !apierrors.IsNotFound(err) {
+		t.Fatalf("TrainJob must not be created before NextRoundAfter, err=%v", err)
+	}
+
+	// Advance past backoff window.
+	now = fixedNow.Add(31 * time.Second)
+	reconcileOnce(t, r, tk.Name)
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: name}, &tj); err != nil {
+		t.Fatalf("TrainJob must be created once backoff elapsed: %v", err)
+	}
+}
+
+func TestPodFailedWithDeletionTimestampIsNotPreempted(t *testing.T) {
+	tk := task("race", 2, 0)
+	tk.Status.StartedRound = 2
+	pod := workerPod(tk.Name, 2, "gn-a")
+	nowMeta := metav1.NewTime(fixedNow)
+	pod.DeletionTimestamp = &nowMeta
+	pod.Finalizers = []string{"test/hold"}
+	pod.Status = corev1.PodStatus{
+		Phase: corev1.PodFailed,
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name:  render.NodeContainerName,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 2}},
+		}},
+	}
+	tj := &trainerv1alpha1.TrainJob{
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 2}), Namespace: tk.Namespace,
+	}
+	r, c := newReconciler(t, tk, pod, tj)
+
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Status.RestartCount != 1 || got.Status.PreemptionCount != 0 {
+		t.Fatalf("restartCount=%d preemptionCount=%d, want 1/0 (PodFailed exit code must win over DeletionTimestamp)",
+			got.Status.RestartCount, got.Status.PreemptionCount)
+	}
+	if got.Status.Reason != trainpilotv1alpha1.ReasonExitCode {
+		t.Fatalf("reason = %q, want ExitCode", got.Status.Reason)
+	}
+}
+
+func TestNodeUnknownRespectsGracePeriod(t *testing.T) {
+	tk := task("node-blip", 1, 0)
+	tk.Status.Round = 3
+	tk.Status.StartedRound = 3
+	pod := workerPod(tk.Name, 3, "gn-blip")
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	node := &corev1.Node{
+		Name: "gn-blip",
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{
+				Type:               corev1.NodeReady,
+				Status:             corev1.ConditionUnknown,
+				LastTransitionTime: metav1.NewTime(fixedNow.Add(-20 * time.Second)),
+			}},
+		},
+	}
+	tj := &trainerv1alpha1.TrainJob{
+		Name: render.Names(tk.Name, render.Round{RunID: 1, Round: 3}), Namespace: tk.Namespace,
+	}
+	now := fixedNow
+	r, c := newReconciler(t, tk, pod, node, tj)
+	r.Now = func() time.Time { return now }
+
+	// Within 1m grace: task stays Running and node is not excluded.
+	reconcileOnce(t, r, tk.Name)
+	got := getTask(t, c, tk.Name)
+	if got.Status.Phase != trainpilotv1alpha1.PhaseRunning || len(got.Status.ExcludedNodes) != 0 {
+		t.Fatalf("transient NodeReady=Unknown triggered failure prematurely: phase=%q excluded=%v",
+			got.Status.Phase, got.Status.ExcludedNodes)
+	}
+
+	// After 1m grace: node failure triggers exclusion.
+	now = fixedNow.Add(90 * time.Second)
+	reconcileOnce(t, r, tk.Name)
+	got = getTask(t, c, tk.Name)
+	if got.Status.Phase != trainpilotv1alpha1.PhaseRecovering || len(got.Status.ExcludedNodes) != 1 {
+		t.Fatalf("prolonged NodeReady=Unknown must exclude node: phase=%q excluded=%v",
+			got.Status.Phase, got.Status.ExcludedNodes)
+	}
+}
+
+func TestRound2OpenSegmentFromPodsAndGPUSeconds(t *testing.T) {
+	tk := task("fast-r2", 2, 8)
+	tk.Status.StartedRound = 2
+	tk.Status.Round = 2
+	tk.Status.Phase = trainpilotv1alpha1.PhaseStarting
+	tk.Status.Segments = []trainpilotv1alpha1.RunSegment{{
+		RunID: 1, Round: 1, EndReason: trainpilotv1alpha1.ReasonExitCode,
+		StartedAt: timePtr(fixedNow.Add(-10 * time.Minute)),
+		EndedAt:   timePtr(fixedNow.Add(-9 * time.Minute)),
+		Workers:   2, GPUsPerWorker: 8, MeteredSeconds: 60,
+	}}
+	started := metav1.NewTime(fixedNow.Add(-30 * time.Second))
+	tk.Status.StartingSince = &started
+
+	round := render.Round{RunID: 1, Round: 2}
+	tj := &trainerv1alpha1.TrainJob{
+		Name: render.Names(tk.Name, round), Namespace: tk.Namespace,
+		Status: trainerv1alpha1.TrainJobStatus{
+			Conditions: []metav1.Condition{{Type: trainerv1alpha1.TrainJobComplete, Status: metav1.ConditionTrue}},
+		},
+	}
+	pod := workerPod(tk.Name, 2, "gn-a")
+	pod.Status.Phase = corev1.PodSucceeded
+	pod.Status.StartTime = &started
+	r, c := newReconciler(t, tk, tj, pod)
+
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if len(got.Status.Segments) != 2 {
+		t.Fatalf("segments = %d, want 2", len(got.Status.Segments))
+	}
+	if got.Status.MeteredSeconds != 90 {
+		t.Fatalf("meteredSeconds = %d, want 90 (60 + 30)", got.Status.MeteredSeconds)
+	}
+	if got.Status.MeteredGPUSeconds != 90*16 {
+		t.Fatalf("meteredGPUSeconds = %d, want %d", got.Status.MeteredGPUSeconds, 90*16)
+	}
+}
+
+func TestTTLSecondsAfterFinishedDeletesRoundResources(t *testing.T) {
+	tk := task("ttl-clean", 1, 0)
+	ttl := int32(60)
+	tk.Spec.TTLSecondsAfterFinished = &ttl
+	tk.Status.Phase = trainpilotv1alpha1.PhaseSucceeded
+	tk.Status.Round = 2
+	tk.Status.StartedRound = 2
+	tk.Status.CompletionTime = timePtr(fixedNow.Add(-2 * time.Minute))
+
+	name := render.Names(tk.Name, render.Round{RunID: 1, Round: 2})
+	tj := &trainerv1alpha1.TrainJob{Name: name, Namespace: tk.Namespace}
+	rt := &trainerv1alpha1.TrainingRuntime{Name: name, Namespace: tk.Namespace}
+	r, c := newReconciler(t, tk, tj, rt)
+
+	reconcileOnce(t, r, tk.Name)
+
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: tk.Namespace, Name: name}, &trainerv1alpha1.TrainJob{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected TrainJob to be deleted after TTL, err=%v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: tk.Namespace, Name: name}, &trainerv1alpha1.TrainingRuntime{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected TrainingRuntime to be deleted after TTL, err=%v", err)
+	}
+}
+
+func TestMaxPreemptionsZeroIsHonored(t *testing.T) {
+	tk := task("zero-preempt", 1, 0)
+	zero := int32(0)
+	tk.Spec.FaultTolerance.MaxPreemptions = &zero
+	tk.Status.StartedRound = 2
+	r, c := newReconciler(t, tk)
+
+	reconcileOnce(t, r, tk.Name)
+
+	got := getTask(t, c, tk.Name)
+	if got.Status.Phase != trainpilotv1alpha1.PhaseInterrupted || got.Status.Reason != trainpilotv1alpha1.ReasonPreemptionsExhausted {
+		t.Fatalf("phase=%q reason=%q, want Interrupted/PreemptionsExhausted when MaxPreemptions=0",
+			got.Status.Phase, got.Status.Reason)
 	}
 }

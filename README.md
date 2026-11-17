@@ -31,12 +31,13 @@ Operator 自己渲染每一轮的 `TrainingRuntime`（而不是复用它人写�
 | 抢占重排（默认 40 次） | `preemptionCount`：operator 删掉当前轮 `TrainJob` 即计一次，不消耗用户重启预算 |
 | 节点故障隔离（≤8 台 FIFO） | `status.excludedNodes` → 下一轮 `nodeAffinity` 的 `hostname NotIn` |
 | 启动失败判定 | 镜像拉取/配置错误 + 准入后 15 分钟启动超时（排队时长不计入），均计入重启预算 |
-| 按段落计量 | `status.segments[]`：从所有 worker Running 到本轮结束，记录该段时长与节点数 |
+| 按段落计量 | `status.segments[]`：从所有 worker Running 到本轮结束，记录该段时长与节点/GPU 数，并汇总 `meteredSeconds` 与 `meteredGPUSeconds` |
 | 最长运行时长（1–720h，默认 168h） | 按**计量时长**累计判定，超时 `Failed/MaxRuntimeExceeded` |
 | 停止 / 继续 / 重跑 | `spec.desiredState`，或注解 `trainpilot.wutz.dev/action=stop\|continue\|rerun=<id>` |
 | `/dev/shm` 为内存的 50% | `--shared-memory-ratio`（默认 0.5），Memory emptyDir 挂到 `/dev/shm` |
-| 多机 + 8 卡自动 RoCE | worker>1 且每 worker 8 卡时自动 `hostNetwork` + `rdma/hca: 1` + `ClusterFirstWithHostNet` |
-| 运行记录 | `status.workers[]`（pod、NODE_RANK、节点、阶段）、`status.conditions`、事件 |
+| 多机 + 8 卡自动 RoCE | worker>1 且每 worker ≥8 卡时自动 `hostNetwork` + `rdma/hca`（可通过 `spec.rdma` 与 `--rdma-resource-name`/`--rdma-per-worker` 覆盖） |
+| Pod 配置与清理 | 支持 `workingDir`、`imagePullSecrets`、`envFrom`、`masterPort`、`terminationGracePeriodSeconds`、`ttlSecondsAfterFinished` |
+| 观测与指标 | `status.workers[]`、`status.conditions`、K8s Events、`/api/tasks` 看板与 Prometheus 指标（`trainpilot_tasks`、`trainpilot_active_gpus` 等） |
 
 多机时注入的环境变量：`NNODES`、`NODE_RANK`（取自 Job 的 `job-completion-index`）、
 `MASTER_ADDR`（`<jobset>-node-0-0.<jobset>`，由 JobSet 的 headless Service 解析）、
@@ -66,6 +67,9 @@ helm install trainpilot oci://ghcr.io/wutz/trainpilot/charts/trainpilot \
 | `controller.gpuTolerationKeys` | `nvidia.com/gpu` | worker 容忍的污点 key |
 | `controller.sharedMemoryRatio` | `0.5` | `/dev/shm` 占内存比例 |
 | `controller.defaultQueueName` | `""` | 默认 Kueue LocalQueue；留空表示默认不走 Kueue |
+| `controller.rdmaResourceName` / `rdmaPerWorker` | `rdma/hca` / `1` | RDMA 扩展资源名与每 worker 数量 |
+| `controller.defaultMasterPort` | `29500` | 默认 `MASTER_PORT` |
+| `controller.defaultTTLSecondsAfterFinished` | `-1` | 完成后清理底层轮次资源的默认 TTL（秒）；负数禁用 |
 | `webhook.enabled` | `true` | TrainTask 校验（默认 `failurePolicy: Ignore`，不会阻塞创建） |
 | `ingress.host` / `ingress.tls` | `trainpilot.wutz.dev` / 自签 issuer | 看板入口 |
 | `crds.install` | `true` | 随 release 安装并升级 CRD |

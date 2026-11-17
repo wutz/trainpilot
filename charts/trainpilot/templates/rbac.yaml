@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "trainpilot.labels" . | nindent 4 }}
 rules:
-  - apiGroups: [""]
+  - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
   - apiGroups: [""]
@@ -16,7 +16,7 @@ rules:
     resources: ["jobsets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["trainer.kubeflow.org"]
-    resources: ["clustertrainingruntimes", "trainjobs/status"]
+    resources: ["trainjobs/status"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["trainer.kubeflow.org"]
     resources: ["trainingruntimes", "trainjobs"]

@@ -11,6 +11,7 @@ spec:
     - echo "failing on purpose, restart=${RESTART_COUNT}"; exit 3
   workers: 1
   resources:
+    gpusPerWorker: 0
     cpu: "1"
     memory: 1Gi
   faultTolerance:

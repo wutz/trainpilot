@@ -21,6 +21,8 @@ limitations under the License.
 package render
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"strconv"
@@ -68,6 +70,21 @@ const (
 	// InstanceLabel groups all pods of one task across rounds.
 	InstanceLabel = "app.kubernetes.io/instance"
 
+	// TaskLabel identifies the owning TrainTask.
+	TaskLabel = "trainpilot.wutz.dev/task"
+
+	// RunIDLabel identifies the RunID of a round.
+	RunIDLabel = "trainpilot.wutz.dev/run-id"
+
+	// RoundLabel identifies the Round index within a run.
+	RoundLabel = "trainpilot.wutz.dev/round"
+
+	// ManagedByLabel identifies objects created by the TrainPilot controller.
+	ManagedByLabel = "trainpilot.wutz.dev/managed-by"
+
+	// ManagedByValue is the label value on controller-managed objects.
+	ManagedByValue = "trainpilot-controller"
+
 	// QueueNameLabel is the label Kueue reads to place a workload in a LocalQueue.
 	QueueNameLabel = "kueue.x-k8s.io/queue-name"
 
@@ -89,6 +106,12 @@ type Options struct {
 	// DefaultQueueName is the Kueue LocalQueue used when a task sets none.
 	// Empty means tasks are not queued through Kueue unless they name a queue.
 	DefaultQueueName string
+	// RDMAResourceName is the extended resource name for RDMA devices (default "rdma/hca").
+	RDMAResourceName string
+	// RDMAPerWorker is the number of RDMA devices requested per worker when RDMA is enabled (default 1).
+	RDMAPerWorker int32
+	// DefaultMasterPort is the fallback MASTER_PORT when spec.masterPort is unset (default 29500).
+	DefaultMasterPort int32
 }
 
 // QueueName returns the Kueue LocalQueue a task is queued through, or "" when
@@ -118,15 +141,22 @@ type Round struct {
 
 // Names returns the name shared by the TrainingRuntime and TrainJob of a round.
 //
-// <task>-r<run>-<round>, truncated so that the result stays within the
-// 63-character DNS label that Trainer and JobSet require.
+// <task>-r<run>-<round>, truncated with a short deterministic hash when needed
+// so that distinct long task names never collide within the 63-character DNS
+// label that Trainer and JobSet require.
 func Names(taskName string, r Round) string {
 	suffix := fmt.Sprintf("-r%d-%d", r.RunID, r.Round)
-	base := taskName
-	if max := 63 - len(suffix); len(base) > max {
-		base = strings.TrimRight(base[:max], "-")
+	if len(taskName)+len(suffix) <= 63 {
+		return taskName + suffix
 	}
-	return base + suffix
+	sum := sha256.Sum256([]byte(taskName))
+	hash := hex.EncodeToString(sum[:])[:6]
+	prefixLen := max(63-len(suffix)-1-len(hash), 1)
+	base := strings.TrimRight(taskName[:prefixLen], "-")
+	if base == "" {
+		base = "t"
+	}
+	return base + "-" + hash + suffix
 }
 
 // MasterAddr is the rendezvous address of worker 0 for a TrainJob.
@@ -136,24 +166,37 @@ func MasterAddr(trainJobName string) string {
 	return fmt.Sprintf("%s-node-0-0.%s", trainJobName, trainJobName)
 }
 
-// RDMAEnabled reports whether the task gets host networking and an RDMA device
-// (multi-node tasks enable RDMA automatically when GPUs per worker >= 8;
-// for multi-node with fewer GPUs, RDMA and hostNetwork are still enabled to support
-// cross-node communication, though RDMA hardware may not be utilized).
+// MasterPort returns the effective rendezvous port for a task.
+func MasterPort(spec *trainpilotv1alpha1.TrainTaskSpec, opts Options) string {
+	if spec.MasterPort != nil && *spec.MasterPort > 0 {
+		return strconv.Itoa(int(*spec.MasterPort))
+	}
+	if opts.DefaultMasterPort > 0 {
+		return strconv.Itoa(int(opts.DefaultMasterPort))
+	}
+	return MASTERPort
+}
+
+// RDMAEnabled reports whether the task gets host networking and an RDMA device.
+// Unless overridden by spec.rdma, multi-node tasks with >= 8 GPUs per worker
+// enable RDMA automatically.
 func RDMAEnabled(spec *trainpilotv1alpha1.TrainTaskSpec) bool {
-	return spec.Workers > 1
+	if spec.RDMA != nil {
+		return *spec.RDMA
+	}
+	return spec.Workers > 1 && spec.Resources.GPUsPerWorker >= 8
 }
 
 // ObjectLabels are applied to every object the operator creates for a task.
 func ObjectLabels(taskName string, r Round) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":         "trainpilot",
-		"app.kubernetes.io/component":    "training",
-		InstanceLabel:                    taskName,
-		"trainpilot.wutz.dev/task":       taskName,
-		"trainpilot.wutz.dev/run-id":     strconv.Itoa(int(r.RunID)),
-		"trainpilot.wutz.dev/round":      strconv.Itoa(int(r.Round)),
-		"trainpilot.wutz.dev/managed-by": "trainpilot-controller",
+		"app.kubernetes.io/name":      "trainpilot",
+		"app.kubernetes.io/component": "training",
+		InstanceLabel:                 taskName,
+		TaskLabel:                     taskName,
+		RunIDLabel:                    strconv.Itoa(int(r.RunID)),
+		RoundLabel:                    strconv.Itoa(int(r.Round)),
+		ManagedByLabel:                ManagedByValue,
 	}
 }
 
@@ -232,9 +275,9 @@ func WorkerPodSpec(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) co
 		requests[GPUKey] = gpu.DeepCopy()
 	}
 	if RDMAEnabled(spec) {
-		one := *resource.NewQuantity(1, resource.DecimalSI)
-		limits[RDMAKey] = one
-		requests[RDMAKey] = one.DeepCopy()
+		rdmaKey, rdmaQty := rdmaResource(opts)
+		limits[rdmaKey] = rdmaQty
+		requests[rdmaKey] = rdmaQty.DeepCopy()
 	}
 
 	volumes := []corev1.Volume{sharedMemoryVolume(memory, opts.SharedMemoryRatio)}
@@ -248,26 +291,38 @@ func WorkerPodSpec(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) co
 			[]trainpilotv1alpha1.StorageMount{*spec.PublicData}, "public")
 	}
 
-	env := platformEnv(task, r)
+	env := platformEnv(task, r, opts)
 	env = mergeEnv(env, spec.Env)
 
 	command := containerCommand(strings.Join(spec.Command, "\n"))
 
+	grace := int64(30)
+	if spec.TerminationGracePeriodSeconds != nil {
+		grace = *spec.TerminationGracePeriodSeconds
+	}
+
+	container := corev1.Container{
+		Name:         NodeContainerName,
+		Image:        spec.Image,
+		Command:      command,
+		Env:          env,
+		EnvFrom:      spec.EnvFrom,
+		Resources:    corev1.ResourceRequirements{Limits: limits, Requests: requests},
+		VolumeMounts: mounts,
+	}
+	if spec.WorkingDir != "" {
+		container.WorkingDir = spec.WorkingDir
+	}
+
 	podSpec := corev1.PodSpec{
 		RestartPolicy:                 corev1.RestartPolicyNever,
-		TerminationGracePeriodSeconds: new(int64(30)),
-		Containers: []corev1.Container{{
-			Name:         NodeContainerName,
-			Image:        spec.Image,
-			Command:      command,
-			Env:          env,
-			Resources:    corev1.ResourceRequirements{Limits: limits, Requests: requests},
-			VolumeMounts: mounts,
-		}},
-		Volumes:      volumes,
-		Affinity:     affinity(task, r, opts),
-		NodeSelector: nodeSelector(spec, opts),
-		Tolerations:  tolerations(spec, opts),
+		TerminationGracePeriodSeconds: &grace,
+		ImagePullSecrets:              spec.ImagePullSecrets,
+		Containers:                    []corev1.Container{container},
+		Volumes:                       volumes,
+		Affinity:                      affinity(task, r),
+		NodeSelector:                  nodeSelector(spec, opts),
+		Tolerations:                   tolerations(spec, opts),
 	}
 	if opts.ServiceAccountName != "" {
 		podSpec.ServiceAccountName = opts.ServiceAccountName
@@ -302,14 +357,14 @@ func containerCommand(script string) []string {
 
 // platformEnv is the set of variables every worker receives. PET_* is added by
 // Trainer itself and deliberately not duplicated here.
-func platformEnv(task *trainpilotv1alpha1.TrainTask, r Round) []corev1.EnvVar {
+func platformEnv(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{Name: "TASK_ID", Value: task.Name},
 		{Name: "RUN_ID", Value: strconv.Itoa(int(r.RunID))},
 		{Name: "RESTART_COUNT", Value: strconv.Itoa(int(r.RestartCount))},
 		{Name: "NNODES", Value: strconv.Itoa(int(task.Spec.Workers))},
 		{Name: "MASTER_ADDR", Value: MasterAddr(Names(task.Name, r))},
-		{Name: "MASTER_PORT", Value: MASTERPort},
+		{Name: "MASTER_PORT", Value: MasterPort(&task.Spec, opts)},
 		{
 			// Same source as PET_NODE_RANK, offered under the task-wide name too.
 			Name: "NODE_RANK",
@@ -321,6 +376,18 @@ func platformEnv(task *trainpilotv1alpha1.TrainTask, r Round) []corev1.EnvVar {
 			},
 		},
 	}
+}
+
+func rdmaResource(opts Options) (corev1.ResourceName, resource.Quantity) {
+	key := RDMAKey
+	if opts.RDMAResourceName != "" {
+		key = corev1.ResourceName(opts.RDMAResourceName)
+	}
+	count := int64(1)
+	if opts.RDMAPerWorker > 0 {
+		count = int64(opts.RDMAPerWorker)
+	}
+	return key, *resource.NewQuantity(count, resource.DecimalSI)
 }
 
 func sharedMemoryVolume(memory resource.Quantity, ratio float64) corev1.Volume {
@@ -413,40 +480,37 @@ func tolerations(spec *trainpilotv1alpha1.TrainTaskSpec, opts Options) []corev1.
 	return append(out, spec.Tolerations...)
 }
 
-// affinity spreads workers over distinct nodes and keeps them off nodes excluded
-// earlier in the same run. Hard anti-affinity guarantees the gang occupies
-// `workers` different nodes, which multi-node RDMA runs need.
-func affinity(task *trainpilotv1alpha1.TrainTask, r Round, opts Options) *corev1.Affinity {
+// affinity spreads workers of the same round over distinct nodes and keeps them
+// off nodes excluded earlier in the same run. Hard anti-affinity is scoped to
+// the current run/round so terminating pods from an older round do not block
+// scheduling onto healthy nodes.
+func affinity(task *trainpilotv1alpha1.TrainTask, r Round) *corev1.Affinity {
 	a := &corev1.Affinity{}
 	if task.Spec.Workers > 1 {
 		a.PodAntiAffinity = &corev1.PodAntiAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
 				LabelSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{InstanceLabel: task.Name},
+					MatchLabels: map[string]string{
+						InstanceLabel: task.Name,
+						RunIDLabel:    strconv.Itoa(int(r.RunID)),
+						RoundLabel:    strconv.Itoa(int(r.Round)),
+					},
 				},
 				TopologyKey: HostnameLabel,
 			}},
 		}
 	}
 
-	terms := []corev1.NodeSelectorRequirement{}
-	if task.Spec.Resources.GPUsPerWorker > 0 {
-		terms = append(terms, corev1.NodeSelectorRequirement{
-			Key:      gpuLabel(opts),
-			Operator: corev1.NodeSelectorOpExists,
-		})
-	}
 	if len(r.ExcludedNodes) > 0 {
-		terms = append(terms, corev1.NodeSelectorRequirement{
-			Key:      HostnameLabel,
-			Operator: corev1.NodeSelectorOpNotIn,
-			Values:   r.ExcludedNodes,
-		})
-	}
-	if len(terms) > 0 {
 		a.NodeAffinity = &corev1.NodeAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
-				NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: terms}},
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      HostnameLabel,
+						Operator: corev1.NodeSelectorOpNotIn,
+						Values:   r.ExcludedNodes,
+					}},
+				}},
 			},
 		}
 	}

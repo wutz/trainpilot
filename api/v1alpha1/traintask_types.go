@@ -67,7 +67,6 @@ const (
 	ReasonPreemptionsExhausted = "PreemptionsExhausted"
 	ReasonQueueTimeout         = "QueueTimeout"
 	ReasonUserStopped          = "UserStopped"
-	ReasonConfigChanged        = "ConfigChanged"
 )
 
 // Starting steps shown next to the Starting phase.
@@ -81,9 +80,10 @@ const (
 // WorkerResources describes the per-worker compute shape.
 type WorkerResources struct {
 	// GPUsPerWorker is the number of GPUs attached to every worker.
+	// +optional
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0
-	GPUsPerWorker int32 `json:"gpusPerWorker,omitempty"`
+	GPUsPerWorker int32 `json:"gpusPerWorker"`
 
 	// CPU is the CPU request/limit per worker, e.g. "16".
 	// +kubebuilder:default="8"
@@ -119,7 +119,7 @@ type FaultTolerance struct {
 	// +kubebuilder:default=true
 	AutoRestart bool `json:"autoRestart,omitempty"`
 
-	// MaxRestarts bounds failure-class automatic restarts (1-100, default 10).
+	// MaxRestarts bounds failure-class automatic restarts (0-100, default 10).
 	// Preemptions do not consume this budget.
 	// +kubebuilder:default=10
 	// +kubebuilder:validation:Minimum=0
@@ -128,10 +128,11 @@ type FaultTolerance struct {
 
 	// MaxPreemptions is the platform-side re-queue budget consumed by preemptions
 	// (default 40). It is not part of the user-facing create form.
+	// +optional
 	// +kubebuilder:default=40
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=1000
-	MaxPreemptions int32 `json:"maxPreemptions,omitempty"`
+	MaxPreemptions *int32 `json:"maxPreemptions,omitempty"`
 
 	// QueueTimeoutSeconds bounds a single wait in the queue (default 24h).
 	// +kubebuilder:default=86400
@@ -177,6 +178,13 @@ type TrainTaskSpec struct {
 	// type label configured with --gpu-node-label (e.g. a100, h100).
 	GPUType string `json:"gpuType,omitempty"`
 
+	// WorkingDir sets the container's working directory.
+	WorkingDir string `json:"workingDir,omitempty"`
+
+	// ImagePullSecrets references secrets in the same namespace for pulling
+	// private training images.
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+
 	// NodeSelector is merged into the worker node selector.
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 
@@ -187,11 +195,39 @@ type TrainTaskSpec struct {
 	// (KEY / TOKEN / SECRET / PASS) are masked in the UI, not in the pod.
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
+	// EnvFrom populates environment variables from ConfigMaps or Secrets.
+	EnvFrom []corev1.EnvFromSource `json:"envFrom,omitempty"`
+
 	// SharedStorage is mounted read-write into every worker.
 	SharedStorage []StorageMount `json:"sharedStorage,omitempty"`
 
 	// PublicData is an optional read-only platform dataset mount.
 	PublicData *StorageMount `json:"publicData,omitempty"`
+
+	// RDMA controls whether workers request hostNetwork and an RDMA device.
+	// Nil defaults to auto (enabled when workers > 1 and gpusPerWorker >= 8).
+	// +optional
+	RDMA *bool `json:"rdma,omitempty"`
+
+	// MasterPort overrides the rendezvous port injected as MASTER_PORT (default 29500).
+	// +optional
+	// +kubebuilder:validation:Minimum=1024
+	// +kubebuilder:validation:Maximum=65535
+	MasterPort *int32 `json:"masterPort,omitempty"`
+
+	// TerminationGracePeriodSeconds sets the pod graceful shutdown window
+	// (default 30s) so training processes can flush checkpoints on preemption or stop.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=3600
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
+
+	// TTLSecondsAfterFinished cleans up finished round resources (TrainJob,
+	// TrainingRuntime, JobSet, Pods) this many seconds after CompletionTime
+	// while keeping the TrainTask status.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 
 	// FaultTolerance configures automatic restarts and runtime limits.
 	// +kubebuilder:default={}
@@ -240,6 +276,8 @@ type RunSegment struct {
 	MeteredSeconds int64 `json:"meteredSeconds"`
 	// Workers is the worker count the segment was metered at.
 	Workers int32 `json:"workers,omitempty"`
+	// GPUsPerWorker is the per-worker GPU count the segment was metered at.
+	GPUsPerWorker int32 `json:"gpusPerWorker,omitempty"`
 }
 
 // WorkerPod reports one worker's placement.
@@ -252,6 +290,8 @@ type WorkerPod struct {
 	Node string `json:"node,omitempty"`
 	// Phase is the pod phase.
 	Phase string `json:"phase,omitempty"`
+	// Ready reports whether the PodReady condition is True.
+	Ready bool `json:"ready,omitempty"`
 }
 
 // TrainTaskStatus defines the observed state of TrainTask.
@@ -303,11 +343,23 @@ type TrainTaskStatus struct {
 	// counted against it.
 	StartingSince *metav1.Time `json:"startingSince,omitempty"`
 
+	// NextRoundAfter is the earliest time a recovering task may create its next round.
+	NextRoundAfter *metav1.Time `json:"nextRoundAfter,omitempty"`
+
 	// SegmentStartedAt is when the current metered segment started.
 	SegmentStartedAt *metav1.Time `json:"segmentStartedAt,omitempty"`
 
 	// MeteredSeconds is the accumulated metered time of the current run.
 	MeteredSeconds int64 `json:"meteredSeconds,omitempty"`
+
+	// MeteredGPUSeconds is the accumulated GPU-seconds (workers * gpusPerWorker * seconds)
+	// of the current run.
+	MeteredGPUSeconds int64 `json:"meteredGPUSeconds,omitempty"`
+
+	// ArchivedMeteredSeconds and ArchivedMeteredGPUSeconds retain totals from
+	// closed segments trimmed past the segment history cap.
+	ArchivedMeteredSeconds    int64 `json:"archivedMeteredSeconds,omitempty"`
+	ArchivedMeteredGPUSeconds int64 `json:"archivedMeteredGPUSeconds,omitempty"`
 
 	// Segments is the per-round metering history of the current run.
 	Segments []RunSegment `json:"segments,omitempty"`
@@ -386,10 +438,10 @@ func (s *TrainTaskSpec) EffectiveMaxPreemptions() int32 {
 	if !s.FaultTolerance.AutoRestart {
 		return 0
 	}
-	if s.FaultTolerance.MaxPreemptions == 0 {
+	if s.FaultTolerance.MaxPreemptions == nil {
 		return 40
 	}
-	return s.FaultTolerance.MaxPreemptions
+	return *s.FaultTolerance.MaxPreemptions
 }
 
 // WantsRunning reports whether the task should currently hold resources.

@@ -189,3 +189,99 @@ func TestUpdateAllowsStopAndContinue(t *testing.T) {
 		t.Fatalf("stop rejected: %v", err)
 	}
 }
+
+func TestCreateRejectsInvalidQuantities(t *testing.T) {
+	w := &TrainTaskWebhook{}
+	for _, cpu := range []string{"0", "-1", "not-a-qty"} {
+		tk := mkTask()
+		tk.Spec.Resources.CPU = cpu
+		if _, err := w.ValidateCreate(context.Background(), tk); err == nil {
+			t.Fatalf("cpu %q must be rejected", cpu)
+		}
+	}
+	for _, mem := range []string{"0", "-1Gi", "64GB"} {
+		tk := mkTask()
+		tk.Spec.Resources.Memory = mem
+		if _, err := w.ValidateCreate(context.Background(), tk); err == nil {
+			t.Fatalf("memory %q must be rejected", mem)
+		}
+	}
+	tk := mkTask()
+	tk.Spec.Resources.CPU = "4"
+	tk.Spec.Resources.Memory = "16Gi"
+	if _, err := w.ValidateCreate(context.Background(), tk); err != nil {
+		t.Fatalf("valid resources rejected: %v", err)
+	}
+}
+
+func TestCreateRejectsDevShmOverlap(t *testing.T) {
+	w := &TrainTaskWebhook{}
+	for _, p := range []string{"/dev/shm", "/dev/shm/cache", "/dev"} {
+		tk := mkTask()
+		tk.Spec.SharedStorage = []trainpilotv1alpha1.StorageMount{{ClaimName: "pvc", MountPath: p}}
+		if _, err := w.ValidateCreate(context.Background(), tk); err == nil {
+			t.Fatalf("mount %q overlapping /dev/shm must be rejected", p)
+		}
+	}
+}
+
+func TestCreateValidatesEnvFrom(t *testing.T) {
+	w := &TrainTaskWebhook{}
+	bad := [][]corev1.EnvFromSource{
+		{{}},
+		{{
+			ConfigMapRef: &corev1.ConfigMapEnvSource{Name: "cm"},
+			SecretRef:    &corev1.SecretEnvSource{Name: "sec"},
+		}},
+		{{ConfigMapRef: &corev1.ConfigMapEnvSource{}}},
+	}
+	for i, src := range bad {
+		tk := mkTask()
+		tk.Spec.EnvFrom = src
+		if _, err := w.ValidateCreate(context.Background(), tk); err == nil {
+			t.Fatalf("case %d invalid envFrom must be rejected", i)
+		}
+	}
+	tk := mkTask()
+	tk.Spec.EnvFrom = []corev1.EnvFromSource{{
+		SecretRef: &corev1.SecretEnvSource{Name: "hf-token"},
+	}}
+	if _, err := w.ValidateCreate(context.Background(), tk); err != nil {
+		t.Fatalf("valid envFrom rejected: %v", err)
+	}
+}
+
+func TestUpdateFreezesStructuralFieldsWithinARun(t *testing.T) {
+	w := &TrainTaskWebhook{}
+	oldTask := mkTask()
+
+	mutators := map[string]func(*trainpilotv1alpha1.TrainTask){
+		"workers":    func(tk *trainpilotv1alpha1.TrainTask) { tk.Spec.Workers = 4 },
+		"resources":  func(tk *trainpilotv1alpha1.TrainTask) { tk.Spec.Resources.GPUsPerWorker = 2 },
+		"gpuType":    func(tk *trainpilotv1alpha1.TrainTask) { tk.Spec.GPUType = "H100" },
+		"queueName":  func(tk *trainpilotv1alpha1.TrainTask) { tk.Spec.QueueName = "gpu" },
+		"workingDir": func(tk *trainpilotv1alpha1.TrainTask) { tk.Spec.WorkingDir = "/app" },
+		"rdma":       func(tk *trainpilotv1alpha1.TrainTask) { tk.Spec.RDMA = new(true) },
+		"env": func(tk *trainpilotv1alpha1.TrainTask) {
+			tk.Spec.Env = []corev1.EnvVar{{Name: "FOO", Value: "bar"}}
+		},
+	}
+	for name, fn := range mutators {
+		newTask := mkTask()
+		fn(newTask)
+		if _, err := w.ValidateUpdate(context.Background(), oldTask, newTask); err == nil {
+			t.Fatalf("%s change within same runID must be rejected", name)
+		}
+	}
+
+	// Lifecycle and tolerance fields stay mutable within the same runID.
+	newTask := mkTask()
+	newTask.Spec.Description = "updated note"
+	newTask.Spec.Suspend = true
+	newTask.Spec.FaultTolerance.MaxRestarts = 5
+	ttl := int32(300)
+	newTask.Spec.TTLSecondsAfterFinished = &ttl
+	if _, err := w.ValidateUpdate(context.Background(), oldTask, newTask); err != nil {
+		t.Fatalf("mutable lifecycle/tolerance update rejected: %v", err)
+	}
+}

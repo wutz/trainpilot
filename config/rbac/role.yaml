@@ -7,13 +7,6 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - ""
-  resources:
   - nodes
   - pods
   verbs:
@@ -21,18 +14,17 @@ rules:
   - list
   - watch
 - apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - jobset.x-k8s.io
   resources:
   - jobsets
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - trainer.kubeflow.org
-  resources:
-  - clustertrainingruntimes
-  - trainjobs/status
   verbs:
   - get
   - list
@@ -49,6 +41,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - trainer.kubeflow.org
+  resources:
+  - trainjobs/status
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - trainpilot.wutz.dev
