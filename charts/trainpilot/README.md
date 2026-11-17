@@ -24,6 +24,10 @@ helm install trainpilot oci://ghcr.io/wutz/trainpilot/charts/trainpilot \
 | `controller.sharedMemoryRatio` | float | `0.5` | `/dev/shm` 占内存上限比例 |
 | `controller.workerServiceAccount` | string | `""` | worker pod 使用的 ServiceAccount |
 | `controller.defaultQueueName` | string | `""` | 默认 Kueue LocalQueue（由管理员创建）；留空表示不走 Kueue 排队 |
+| `controller.rdmaResourceName` | string | `rdma/hca` | 开启 RDMA 时 worker 请求的扩展资源名 |
+| `controller.rdmaPerWorker` | int | `1` | 开启 RDMA 时每个 worker 请求的设备数量 |
+| `controller.defaultMasterPort` | int | `29500` | 未设置 `spec.masterPort` 时的默认 `MASTER_PORT` |
+| `controller.defaultTTLSecondsAfterFinished` | int | `-1` | 完成后清理底层轮次资源的默认 TTL（秒）；负数表示禁用 |
 | `controller.extraArgs` | list | `[]` | 追加的 manager 参数 |
 | `ui.enabled` | bool | `true` | 内嵌只读看板 |
 | `ui.port` | int | `8082` | 看板监听端口 |

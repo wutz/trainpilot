@@ -26,10 +26,14 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -41,6 +45,8 @@ import (
 
 	trainpilotv1alpha1 "github.com/wutz/trainpilot/api/v1alpha1"
 	"github.com/wutz/trainpilot/internal/controller"
+	"github.com/wutz/trainpilot/internal/metrics"
+	"github.com/wutz/trainpilot/internal/render"
 	"github.com/wutz/trainpilot/internal/ui"
 	webhookv1alpha1 "github.com/wutz/trainpilot/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -76,6 +82,10 @@ func main() {
 	var sharedMemoryRatio float64
 	var workerServiceAccount string
 	var defaultQueueName string
+	var rdmaResourceName string
+	var rdmaPerWorker int
+	var defaultMasterPort int
+	var defaultTTLSeconds int
 	var enableWebhook bool
 	var uiBindAddress string
 	var tlsOpts []func(*tls.Config)
@@ -110,10 +120,18 @@ func main() {
 		"ServiceAccount name for worker pods; empty keeps the namespace default.")
 	flag.StringVar(&defaultQueueName, "default-queue-name", "",
 		"Kueue LocalQueue that admits tasks which set no spec.queueName; empty disables queueing by default.")
+	flag.StringVar(&rdmaResourceName, "rdma-resource-name", string(render.RDMAKey),
+		"Extended resource name requested on worker pods when RDMA is enabled.")
+	flag.IntVar(&rdmaPerWorker, "rdma-per-worker", 1,
+		"Number of RDMA devices requested per worker pod when RDMA is enabled.")
+	flag.IntVar(&defaultMasterPort, "default-master-port", 29500,
+		"Default rendezvous port injected as MASTER_PORT when spec.masterPort is unset.")
+	flag.IntVar(&defaultTTLSeconds, "default-ttl-seconds-after-finished", -1,
+		"Default seconds after completion before finished round resources are cleaned up; negative disables.")
 	flag.BoolVar(&enableWebhook, "enable-webhook", true,
 		"Serve TrainTask admission validation. Disable when the cluster cannot reach the webhook.")
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -189,37 +207,47 @@ func main() {
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "968253f1.wutz.dev",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		Scheme:                        scheme,
+		Metrics:                       metricsServerOptions,
+		WebhookServer:                 webhookServer,
+		HealthProbeBindAddress:        probeAddr,
+		LeaderElection:                enableLeaderElection,
+		LeaderElectionID:              "968253f1.wutz.dev",
+		LeaderElectionReleaseOnCancel: true,
+		Cache: cache.Options{
+			DefaultTransform: cache.TransformStripManagedFields(),
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Pod{}: {
+					Label: labels.SelectorFromSet(labels.Set{render.ManagedByLabel: render.ManagedByValue}),
+				},
+			},
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
 		os.Exit(1)
 	}
 
+	metrics.Register(mgr.GetCache())
+
+	var defaultTTLPtr *int32
+	if defaultTTLSeconds >= 0 {
+		v := int32(defaultTTLSeconds)
+		defaultTTLPtr = &v
+	}
+
 	if err := (&controller.TrainTaskReconciler{
-		Client:             mgr.GetClient(),
-		Scheme:             mgr.GetScheme(),
-		GPULabel:           gpuLabel,
-		GPUTolerationKeys:  splitList(gpuTolerationKeys),
-		SharedMemoryRatio:  sharedMemoryRatio,
-		ServiceAccountName: workerServiceAccount,
-		DefaultQueueName:   defaultQueueName,
+		Client:                         mgr.GetClient(),
+		Scheme:                         mgr.GetScheme(),
+		GPULabel:                       gpuLabel,
+		GPUTolerationKeys:              splitList(gpuTolerationKeys),
+		SharedMemoryRatio:              sharedMemoryRatio,
+		ServiceAccountName:             workerServiceAccount,
+		RDMAResourceName:               rdmaResourceName,
+		RDMAPerWorker:                  int32(rdmaPerWorker),
+		DefaultMasterPort:              int32(defaultMasterPort),
+		DefaultQueueName:               defaultQueueName,
+		DefaultTTLSecondsAfterFinished: defaultTTLPtr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "traintask")
 		os.Exit(1)

@@ -24,17 +24,19 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
-
-	corev1 "k8s.io/api/core/v1"
 
 	trainpilotv1alpha1 "github.com/wutz/trainpilot/api/v1alpha1"
 )
@@ -70,8 +72,10 @@ func (w *TrainTaskWebhook) ValidateCreate(_ context.Context, task *trainpilotv1a
 
 // ValidateUpdate implements webhook.CustomValidator.
 //
-// Re-run (spec.runID increments) may change the image and command; an automatic
-// restart or a continue (same runID) may not.
+// Re-run (spec.runID increments) may change pod/scheduling fields; an automatic
+// restart or a continue (same runID) keeps structural worker fields frozen while
+// allowing lifecycle/tolerance updates (desiredState, suspend, faultTolerance,
+// description, terminationGracePeriodSeconds, ttlSecondsAfterFinished).
 func (w *TrainTaskWebhook) ValidateUpdate(_ context.Context,
 	oldTask, newTask *trainpilotv1alpha1.TrainTask) (admission.Warnings, error) {
 	if err := w.validate(newTask); err != nil {
@@ -84,20 +88,69 @@ func (w *TrainTaskWebhook) ValidateUpdate(_ context.Context,
 			"runID cannot decrease"))
 	}
 	if newTask.Spec.RunID == oldTask.Spec.RunID {
-		if oldTask.Spec.Image != newTask.Spec.Image {
-			errs = append(errs, field.Forbidden(field.NewPath("spec", "image"),
-				"image can only change with a re-run (increment spec.runID)"))
-		}
-		if strings.Join(oldTask.Spec.Command, "\n") != strings.Join(newTask.Spec.Command, "\n") {
-			errs = append(errs, field.Forbidden(field.NewPath("spec", "command"),
-				"command can only change with a re-run (increment spec.runID)"))
-		}
+		errs = append(errs, validateRunIDFrozenFields(&oldTask.Spec, &newTask.Spec)...)
 	}
 	if len(errs) > 0 {
 		return nil, apierrors.NewInvalid(schema.GroupKind{Group: trainpilotv1alpha1.GroupVersion.Group,
 			Kind: "TrainTask"}, newTask.Name, errs)
 	}
 	return nil, nil
+}
+
+func validateRunIDFrozenFields(oldSpec, newSpec *trainpilotv1alpha1.TrainTaskSpec) field.ErrorList {
+	var errs field.ErrorList
+	specPath := field.NewPath("spec")
+	const msg = "can only change with a re-run (increment spec.runID)"
+
+	if oldSpec.Image != newSpec.Image {
+		errs = append(errs, field.Forbidden(specPath.Child("image"), "image "+msg))
+	}
+	if !slices.Equal(oldSpec.Command, newSpec.Command) {
+		errs = append(errs, field.Forbidden(specPath.Child("command"), "command "+msg))
+	}
+	if oldSpec.Workers != newSpec.Workers {
+		errs = append(errs, field.Forbidden(specPath.Child("workers"), "workers "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.Resources, newSpec.Resources) {
+		errs = append(errs, field.Forbidden(specPath.Child("resources"), "resources "+msg))
+	}
+	if oldSpec.GPUType != newSpec.GPUType {
+		errs = append(errs, field.Forbidden(specPath.Child("gpuType"), "gpuType "+msg))
+	}
+	if oldSpec.WorkingDir != newSpec.WorkingDir {
+		errs = append(errs, field.Forbidden(specPath.Child("workingDir"), "workingDir "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.ImagePullSecrets, newSpec.ImagePullSecrets) {
+		errs = append(errs, field.Forbidden(specPath.Child("imagePullSecrets"), "imagePullSecrets "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.NodeSelector, newSpec.NodeSelector) {
+		errs = append(errs, field.Forbidden(specPath.Child("nodeSelector"), "nodeSelector "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.Tolerations, newSpec.Tolerations) {
+		errs = append(errs, field.Forbidden(specPath.Child("tolerations"), "tolerations "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.Env, newSpec.Env) {
+		errs = append(errs, field.Forbidden(specPath.Child("env"), "env "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.EnvFrom, newSpec.EnvFrom) {
+		errs = append(errs, field.Forbidden(specPath.Child("envFrom"), "envFrom "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.SharedStorage, newSpec.SharedStorage) {
+		errs = append(errs, field.Forbidden(specPath.Child("sharedStorage"), "sharedStorage "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.PublicData, newSpec.PublicData) {
+		errs = append(errs, field.Forbidden(specPath.Child("publicData"), "publicData "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.RDMA, newSpec.RDMA) {
+		errs = append(errs, field.Forbidden(specPath.Child("rdma"), "rdma "+msg))
+	}
+	if !reflect.DeepEqual(oldSpec.MasterPort, newSpec.MasterPort) {
+		errs = append(errs, field.Forbidden(specPath.Child("masterPort"), "masterPort "+msg))
+	}
+	if oldSpec.QueueName != newSpec.QueueName {
+		errs = append(errs, field.Forbidden(specPath.Child("queueName"), "queueName "+msg))
+	}
+	return errs
 }
 
 // ValidateDelete implements webhook.CustomValidator.
@@ -117,7 +170,9 @@ func (w *TrainTaskWebhook) validate(task *trainpilotv1alpha1.TrainTask) error {
 		errs = append(errs, field.Required(field.NewPath("spec", "command"), "startup command is required"))
 	}
 
+	errs = append(errs, validateResources(spec.Resources)...)
 	errs = append(errs, validateEnv(spec.Env)...)
+	errs = append(errs, validateEnvFrom(spec.EnvFrom)...)
 	errs = append(errs, validateMounts(spec.SharedStorage, nil, field.NewPath("spec", "sharedStorage"))...)
 	if spec.PublicData != nil {
 		errs = append(errs, validateMounts([]trainpilotv1alpha1.StorageMount{*spec.PublicData},
@@ -137,6 +192,32 @@ func (w *TrainTaskWebhook) validate(task *trainpilotv1alpha1.TrainTask) error {
 		}, task.Name, errs)
 	}
 	return nil
+}
+
+func validateResources(res trainpilotv1alpha1.WorkerResources) field.ErrorList {
+	var errs field.ErrorList
+	resPath := field.NewPath("spec", "resources")
+	if res.CPU != "" {
+		qty, err := resource.ParseQuantity(res.CPU)
+		if err != nil {
+			errs = append(errs, field.Invalid(resPath.Child("cpu"), res.CPU,
+				fmt.Sprintf("invalid quantity: %v", err)))
+		} else if qty.Sign() <= 0 {
+			errs = append(errs, field.Invalid(resPath.Child("cpu"), res.CPU,
+				"must be greater than zero"))
+		}
+	}
+	if res.Memory != "" {
+		qty, err := resource.ParseQuantity(res.Memory)
+		if err != nil {
+			errs = append(errs, field.Invalid(resPath.Child("memory"), res.Memory,
+				fmt.Sprintf("invalid quantity: %v", err)))
+		} else if qty.Sign() <= 0 {
+			errs = append(errs, field.Invalid(resPath.Child("memory"), res.Memory,
+				"must be greater than zero"))
+		}
+	}
+	return errs
 }
 
 func validateEnv(env []corev1.EnvVar) field.ErrorList {
@@ -163,15 +244,47 @@ func validateEnv(env []corev1.EnvVar) field.ErrorList {
 	return errs
 }
 
+func validateEnvFrom(envFrom []corev1.EnvFromSource) field.ErrorList {
+	var errs field.ErrorList
+	path := field.NewPath("spec", "envFrom")
+	for i, src := range envFrom {
+		hasCM := src.ConfigMapRef != nil
+		hasSec := src.SecretRef != nil
+		switch {
+		case !hasCM && !hasSec:
+			errs = append(errs, field.Required(path.Index(i),
+				"must set either configMapRef or secretRef"))
+		case hasCM && hasSec:
+			errs = append(errs, field.Invalid(path.Index(i), "",
+				"cannot set both configMapRef and secretRef"))
+		case hasCM && strings.TrimSpace(src.ConfigMapRef.Name) == "":
+			errs = append(errs, field.Required(path.Index(i).Child("configMapRef", "name"),
+				"configMapRef.name is required"))
+		case hasSec && strings.TrimSpace(src.SecretRef.Name) == "":
+			errs = append(errs, field.Required(path.Index(i).Child("secretRef", "name"),
+				"secretRef.name is required"))
+		}
+	}
+	return errs
+}
+
 // validateMounts checks absolute path, no spaces, no "..", not "/",
-// and no overlap with the other list.
+// no overlap with /dev/shm, and no overlap with the other list.
 func validateMounts(list []trainpilotv1alpha1.StorageMount, others []trainpilotv1alpha1.StorageMount,
 	path *field.Path) field.ErrorList {
 	var errs field.ErrorList
 	for i, m := range list {
+		if strings.TrimSpace(m.ClaimName) == "" {
+			errs = append(errs, field.Required(path.Index(i).Child("claimName"), "claimName is required"))
+		}
 		idx := path.Index(i).Child("mountPath")
 		if err := checkMountPath(m.MountPath); err != nil {
 			errs = append(errs, field.Invalid(idx, m.MountPath, err.Error()))
+			continue
+		}
+		if overlap(m.MountPath, "/dev/shm") {
+			errs = append(errs, field.Invalid(idx, m.MountPath,
+				"cannot mount over platform shared memory /dev/shm"))
 			continue
 		}
 		for j, o := range list {

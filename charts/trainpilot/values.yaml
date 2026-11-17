@@ -37,6 +37,13 @@ controller:
   # this chart. Empty means tasks are not queued through Kueue and their
   # TrainJobs start unsuspended.
   defaultQueueName: ""
+  # Extended resource name and count per worker when RDMA is enabled.
+  rdmaResourceName: rdma/hca
+  rdmaPerWorker: 1
+  # Default torch rendezvous port injected as MASTER_PORT.
+  defaultMasterPort: 29500
+  # Seconds after CompletionTime to clean up finished round objects (-1 disables).
+  defaultTTLSecondsAfterFinished: -1
   extraArgs: []
 
 # Read-only dashboard served by the manager itself over plain HTTP.

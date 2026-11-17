@@ -98,29 +98,33 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 type taskView struct {
-	Name            string   `json:"name"`
-	Namespace       string   `json:"namespace"`
-	Phase           string   `json:"phase"`
-	Message         string   `json:"message"`
-	RunID           int32    `json:"runId"`
-	Round           int32    `json:"round"`
-	RestartCount    int32    `json:"restartCount"`
-	MaxRestarts     int32    `json:"maxRestarts"`
-	PreemptionCount int32    `json:"preemptionCount"`
-	MaxPreemptions  int32    `json:"maxPreemptions"`
-	Workers         int32    `json:"workers"`
-	ReadyWorkers    int      `json:"readyWorkers"`
-	GPUsPerWorker   int32    `json:"gpusPerWorker"`
-	GPUType         string   `json:"gpuType"`
-	Image           string   `json:"image"`
-	MeteredSeconds  int64    `json:"meteredSeconds"`
-	Nodes           []string `json:"nodes"`
-	ExcludedNodes   []string `json:"excludedNodes"`
-	StartedAt       string   `json:"startedAt,omitempty"`
-	CompletionTime  string   `json:"completionTime,omitempty"`
-	CreatedAt       string   `json:"createdAt"`
-	StartingStep    string   `json:"startingStep,omitempty"`
-	LastSegmentEnd  string   `json:"lastSegmentEndReason,omitempty"`
+	Name              string   `json:"name"`
+	Namespace         string   `json:"namespace"`
+	Phase             string   `json:"phase"`
+	Reason            string   `json:"reason,omitempty"`
+	Message           string   `json:"message"`
+	DesiredState      string   `json:"desiredState,omitempty"`
+	QueueName         string   `json:"queueName,omitempty"`
+	RunID             int32    `json:"runId"`
+	Round             int32    `json:"round"`
+	RestartCount      int32    `json:"restartCount"`
+	MaxRestarts       int32    `json:"maxRestarts"`
+	PreemptionCount   int32    `json:"preemptionCount"`
+	MaxPreemptions    int32    `json:"maxPreemptions"`
+	Workers           int32    `json:"workers"`
+	ReadyWorkers      int      `json:"readyWorkers"`
+	GPUsPerWorker     int32    `json:"gpusPerWorker"`
+	GPUType           string   `json:"gpuType"`
+	Image             string   `json:"image"`
+	MeteredSeconds    int64    `json:"meteredSeconds"`
+	MeteredGPUSeconds int64    `json:"meteredGpuSeconds"`
+	Nodes             []string `json:"nodes"`
+	ExcludedNodes     []string `json:"excludedNodes"`
+	StartedAt         string   `json:"startedAt,omitempty"`
+	CompletionTime    string   `json:"completionTime,omitempty"`
+	CreatedAt         string   `json:"createdAt"`
+	StartingStep      string   `json:"startingStep,omitempty"`
+	LastSegmentEnd    string   `json:"lastSegmentEndReason,omitempty"`
 }
 
 func writeTasks(w http.ResponseWriter, r *http.Request, c client.Reader) {
@@ -138,31 +142,35 @@ func writeTasks(w http.ResponseWriter, r *http.Request, c client.Reader) {
 			if wp.Node != "" {
 				nodes = append(nodes, wp.Node)
 			}
-			if wp.Phase == "Running" {
+			if wp.Ready {
 				ready++
 			}
 		}
 		v := taskView{
-			Name:            t.Name,
-			Namespace:       t.Namespace,
-			Phase:           string(t.Status.Phase),
-			Message:         t.Status.Message,
-			RunID:           t.Spec.RunID,
-			Round:           t.Status.Round,
-			RestartCount:    t.Status.RestartCount,
-			MaxRestarts:     t.Spec.EffectiveMaxRestarts(),
-			PreemptionCount: t.Status.PreemptionCount,
-			MaxPreemptions:  t.Spec.EffectiveMaxPreemptions(),
-			Workers:         t.Spec.Workers,
-			ReadyWorkers:    ready,
-			GPUsPerWorker:   t.Spec.Resources.GPUsPerWorker,
-			GPUType:         t.Spec.GPUType,
-			Image:           t.Spec.Image,
-			MeteredSeconds:  t.Status.MeteredSeconds,
-			Nodes:           nodes,
-			ExcludedNodes:   t.Status.ExcludedNodes,
-			CreatedAt:       t.CreationTimestamp.UTC().Format(time.RFC3339),
-			StartingStep:    t.Status.StartingStep,
+			Name:              t.Name,
+			Namespace:         t.Namespace,
+			Phase:             string(t.Status.Phase),
+			Reason:            t.Status.Reason,
+			Message:           t.Status.Message,
+			DesiredState:      string(t.Spec.DesiredState),
+			QueueName:         t.Spec.QueueName,
+			RunID:             t.Spec.RunID,
+			Round:             t.Status.Round,
+			RestartCount:      t.Status.RestartCount,
+			MaxRestarts:       t.Spec.EffectiveMaxRestarts(),
+			PreemptionCount:   t.Status.PreemptionCount,
+			MaxPreemptions:    t.Spec.EffectiveMaxPreemptions(),
+			Workers:           t.Spec.Workers,
+			ReadyWorkers:      ready,
+			GPUsPerWorker:     t.Spec.Resources.GPUsPerWorker,
+			GPUType:           t.Spec.GPUType,
+			Image:             t.Spec.Image,
+			MeteredSeconds:    t.Status.MeteredSeconds,
+			MeteredGPUSeconds: t.Status.MeteredGPUSeconds,
+			Nodes:             nodes,
+			ExcludedNodes:     t.Status.ExcludedNodes,
+			CreatedAt:         t.CreationTimestamp.UTC().Format(time.RFC3339),
+			StartingStep:      t.Status.StartingStep,
 		}
 		if t.Status.StartedAt != nil {
 			v.StartedAt = t.Status.StartedAt.UTC().Format(time.RFC3339)

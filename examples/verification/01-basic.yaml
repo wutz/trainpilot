@@ -19,6 +19,7 @@ spec:
       echo done
   workers: 2
   resources:
+    gpusPerWorker: 0
     cpu: "1"
     memory: 1Gi
   faultTolerance:

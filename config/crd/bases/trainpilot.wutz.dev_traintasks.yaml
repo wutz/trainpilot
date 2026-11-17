@@ -245,6 +245,54 @@ spec:
                   - name
                   type: object
                 type: array
+              envFrom:
+                description: EnvFrom populates environment variables from ConfigMaps
+                  or Secrets.
+                items:
+                  description: EnvFromSource represents the source of a set of ConfigMaps
+                    or Secrets
+                  properties:
+                    configMapRef:
+                      description: The ConfigMap to select from
+                      properties:
+                        name:
+                          default: ""
+                          description: |-
+                            Name of the referent.
+                            This field is effectively required, but due to backwards compatibility is
+                            allowed to be empty. Instances of this type with an empty value here are
+                            almost certainly wrong.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                        optional:
+                          description: Specify whether the ConfigMap must be defined
+                          type: boolean
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    prefix:
+                      description: |-
+                        Optional text to prepend to the name of each environment variable.
+                        May consist of any printable ASCII characters except '='.
+                      type: string
+                    secretRef:
+                      description: The Secret to select from
+                      properties:
+                        name:
+                          default: ""
+                          description: |-
+                            Name of the referent.
+                            This field is effectively required, but due to backwards compatibility is
+                            allowed to be empty. Instances of this type with an empty value here are
+                            almost certainly wrong.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                        optional:
+                          description: Specify whether the Secret must be defined
+                          type: boolean
+                      type: object
+                      x-kubernetes-map-type: atomic
+                  type: object
+                type: array
               faultTolerance:
                 default: {}
                 description: FaultTolerance configures automatic restarts and runtime
@@ -268,7 +316,7 @@ spec:
                   maxRestarts:
                     default: 10
                     description: |-
-                      MaxRestarts bounds failure-class automatic restarts (1-100, default 10).
+                      MaxRestarts bounds failure-class automatic restarts (0-100, default 10).
                       Preemptions do not consume this budget.
                     format: int32
                     maximum: 100
@@ -300,6 +348,34 @@ spec:
                 description: Image is the training container image.
                 minLength: 1
                 type: string
+              imagePullSecrets:
+                description: |-
+                  ImagePullSecrets references secrets in the same namespace for pulling
+                  private training images.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+              masterPort:
+                description: MasterPort overrides the rendezvous port injected as
+                  MASTER_PORT (default 29500).
+                format: int32
+                maximum: 65535
+                minimum: 1024
+                type: integer
               nodeSelector:
                 additionalProperties:
                   type: string
@@ -338,6 +414,11 @@ spec:
                 maxLength: 63
                 pattern: ^(none|[a-z0-9]([-a-z0-9]*[a-z0-9])?)$
                 type: string
+              rdma:
+                description: |-
+                  RDMA controls whether workers request hostNetwork and an RDMA device.
+                  Nil defaults to auto (enabled when workers > 1 and gpusPerWorker >= 8).
+                type: boolean
               resources:
                 default: {}
                 description: Resources is the per-worker compute shape.
@@ -397,6 +478,14 @@ spec:
                   Suspend stops the underlying TrainJob without ending the task
                   (equivalent to DesiredState=Stopped, kept for Jobs-style UX).
                 type: boolean
+              terminationGracePeriodSeconds:
+                description: |-
+                  TerminationGracePeriodSeconds sets the pod graceful shutdown window
+                  (default 30s) so training processes can flush checkpoints on preemption or stop.
+                format: int64
+                maximum: 3600
+                minimum: 0
+                type: integer
               tolerations:
                 description: Tolerations are applied to every worker pod.
                 items:
@@ -437,6 +526,14 @@ spec:
                       type: string
                   type: object
                 type: array
+              ttlSecondsAfterFinished:
+                description: |-
+                  TTLSecondsAfterFinished cleans up finished round resources (TrainJob,
+                  TrainingRuntime, JobSet, Pods) this many seconds after CompletionTime
+                  while keeping the TrainTask status.
+                format: int32
+                minimum: 0
+                type: integer
               workers:
                 default: 1
                 description: Workers is the number of workers (>= 1). All workers
@@ -445,6 +542,9 @@ spec:
                 maximum: 256
                 minimum: 1
                 type: integer
+              workingDir:
+                description: WorkingDir sets the container's working directory.
+                type: string
             required:
             - command
             - image
@@ -457,6 +557,15 @@ spec:
                   AppliedAction records the last action id whose status-side effects were
                   applied, so a repeated request is honoured once.
                 type: string
+              archivedMeteredGPUSeconds:
+                format: int64
+                type: integer
+              archivedMeteredSeconds:
+                description: |-
+                  ArchivedMeteredSeconds and ArchivedMeteredGPUSeconds retain totals from
+                  closed segments trimmed past the segment history cap.
+                format: int64
+                type: integer
               completionTime:
                 description: CompletionTime is when the task entered a terminal phase.
                 format: date-time
@@ -535,11 +644,22 @@ spec:
               message:
                 description: Message explains the current phase or the terminal reason.
                 type: string
+              meteredGPUSeconds:
+                description: |-
+                  MeteredGPUSeconds is the accumulated GPU-seconds (workers * gpusPerWorker * seconds)
+                  of the current run.
+                format: int64
+                type: integer
               meteredSeconds:
                 description: MeteredSeconds is the accumulated metered time of the
                   current run.
                 format: int64
                 type: integer
+              nextRoundAfter:
+                description: NextRoundAfter is the earliest time a recovering task
+                  may create its next round.
+                format: date-time
+                type: string
               observedGeneration:
                 description: ObservedGeneration is the last spec generation reconciled.
                 format: int64
@@ -593,6 +713,11 @@ spec:
                       description: EndedAt is when the round ended.
                       format: date-time
                       type: string
+                    gpusPerWorker:
+                      description: GPUsPerWorker is the per-worker GPU count the segment
+                        was metered at.
+                      format: int32
+                      type: integer
                     meteredSeconds:
                       description: MeteredSeconds is the metered duration of the segment.
                       format: int64
@@ -655,6 +780,10 @@ spec:
                     phase:
                       description: Phase is the pod phase.
                       type: string
+                    ready:
+                      description: Ready reports whether the PodReady condition is
+                        True.
+                      type: boolean
                     workerIndex:
                       description: WorkerIndex is PET_NODE_RANK.
                       format: int32

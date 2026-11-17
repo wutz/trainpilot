@@ -43,6 +43,15 @@
   .summary { display: flex; gap: 28px; margin: 28px 0 20px; flex-wrap: wrap; }
   .stat .k { font-family: var(--mono); font-size: 11px; color: var(--mute); text-transform: uppercase; letter-spacing: 0.06em; }
   .stat .v { font-family: var(--mono); font-size: 20px; font-weight: 500; margin-top: 2px; }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+  .ctrl {
+    font-family: var(--mono); font-size: 12px; color: var(--ink);
+    background: var(--elevated); border: 1px solid var(--hairline);
+    border-radius: 6px; padding: 6px 10px; line-height: 1.4;
+    outline: none;
+  }
+  .ctrl:focus { border-color: var(--accent); }
+  .ctrl-search { flex: 1; min-width: 180px; max-width: 280px; }
   .card {
     background: var(--elevated);
     border: 1px solid var(--hairline);
@@ -100,6 +109,24 @@
 
   <div class="summary" id="summary"></div>
 
+  <div class="toolbar">
+    <select class="ctrl" id="filter-ns" aria-label="命名空间筛选">
+      <option value="">全部命名空间</option>
+    </select>
+    <select class="ctrl" id="filter-phase" aria-label="状态筛选">
+      <option value="">全部状态</option>
+      <option value="Queued">排队中 · Queued</option>
+      <option value="Starting">启动中 · Starting</option>
+      <option value="Running">运行中 · Running</option>
+      <option value="Recovering">恢复中 · Recovering</option>
+      <option value="Succeeded">成功 · Succeeded</option>
+      <option value="Failed">失败 · Failed</option>
+      <option value="Stopped">已停止 · Stopped</option>
+      <option value="Interrupted">已中断 · Interrupted</option>
+    </select>
+    <input class="ctrl ctrl-search" id="filter-q" type="search" placeholder="搜索任务名 / 镜像 / 队列…" aria-label="搜索任务">
+  </div>
+
   <div class="card">
     <table>
       <thead>
@@ -131,6 +158,8 @@ const PHASE_LABEL = {
   Succeeded: "成功", Failed: "失败", Stopped: "已停止", Interrupted: "已中断",
 };
 
+let lastData = null;
+
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -145,8 +174,41 @@ function duration(sec) {
   return m > 0 ? `${m}m` : `${s}s`;
 }
 
+function gpuHours(gpuSec) {
+  if (!gpuSec) return "0 GPU·h";
+  const h = gpuSec / 3600;
+  if (h >= 1) return `${h.toFixed(1)} GPU·h`;
+  return `${Math.max(1, Math.round(gpuSec / 60))} GPU·m`;
+}
+
+function syncNamespaces(tasks) {
+  const sel = document.getElementById("filter-ns");
+  const prev = sel.value;
+  const namespaces = Array.from(new Set(tasks.map(t => t.namespace).filter(Boolean))).sort();
+  sel.innerHTML = `<option value="">全部命名空间</option>` +
+    namespaces.map(ns => `<option value="${esc(ns)}">${esc(ns)}</option>`).join("");
+  if (namespaces.includes(prev)) sel.value = prev;
+}
+
 function render(data) {
-  const tasks = data.tasks || [];
+  lastData = data;
+  const allTasks = data.tasks || [];
+  syncNamespaces(allTasks);
+
+  const nsFilter = document.getElementById("filter-ns").value;
+  const phaseFilter = document.getElementById("filter-phase").value;
+  const qFilter = document.getElementById("filter-q").value.trim().toLowerCase();
+
+  const tasks = allTasks.filter(t => {
+    if (nsFilter && t.namespace !== nsFilter) return false;
+    if (phaseFilter && t.phase !== phaseFilter) return false;
+    if (qFilter) {
+      const hay = `${t.name} ${t.namespace} ${t.image} ${t.queueName || ""}`.toLowerCase();
+      if (!hay.includes(qFilter)) return false;
+    }
+    return true;
+  });
+
   const counts = {};
   for (const t of tasks) counts[t.phase] = (counts[t.phase] || 0) + 1;
 
@@ -155,21 +217,25 @@ function render(data) {
   const gpus = tasks.filter(t => t.phase === "Running")
     .reduce((n, t) => n + t.workers * t.gpusPerWorker, 0);
   const metered = tasks.reduce((n, t) => n + (t.meteredSeconds || 0), 0);
+  const meteredGpu = tasks.reduce((n, t) => n + (t.meteredGpuSeconds || 0), 0);
 
   document.getElementById("summary").innerHTML = [
     ["运行中", running],
     ["等待 / 恢复", waiting],
     ["在用 GPU", gpus],
     ["累计计量", duration(metered)],
+    ["GPU 时长", gpuHours(meteredGpu)],
   ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
 
   const updated = new Date(data.generatedAt);
   document.getElementById("updated").textContent = "刷新于 " + updated.toLocaleTimeString("zh-CN");
-  document.getElementById("count").textContent = tasks.length + " 个任务";
+  document.getElementById("count").textContent = tasks.length === allTasks.length
+    ? `${tasks.length} 个任务`
+    : `${tasks.length} / ${allTasks.length} 个任务`;
 
   const body = document.getElementById("rows");
   if (!tasks.length) {
-    body.innerHTML = `<tr><td colspan="7" class="empty">还没有训练任务</td></tr>`;
+    body.innerHTML = `<tr><td colspan="7" class="empty">${allTasks.length ? "没有匹配筛选条件的任务" : "还没有训练任务"}</td></tr>`;
     return;
   }
 
@@ -179,24 +245,32 @@ function render(data) {
     const nodes = (t.nodes || []).map(n => `<span class="chip">${esc(n)}</span>`).join("");
     const excluded = (t.excludedNodes || []).map(n => `<span class="chip bad">✕ ${esc(n)}</span>`).join("");
     const step = phase === "Starting" && t.startingStep ? ` · ${esc(t.startingStep)}` : "";
+    const reason = t.reason && phase !== "Running" && phase !== "Starting" ? ` · ${esc(t.reason)}` : "";
+    const queue = t.queueName ? ` · 队列 ${esc(t.queueName)}` : "";
+    const gpuSub = t.gpuType ? ` · ${esc(t.gpuType)}` : "";
+    const meterSub = t.meteredGpuSeconds > 0 ? gpuHours(t.meteredGpuSeconds) : `${t.workers} 节点`;
     return `<tr>
       <td>
         <div class="name">${esc(t.name)}</div>
-        <div class="sub">${esc(t.namespace)} · ${esc(t.image.split("/").pop())}</div>
+        <div class="sub">${esc(t.namespace)} · ${esc(t.image.split("/").pop())}${queue}</div>
       </td>
       <td>
-        <span class="phase p-${esc(phase)}"><span class="dot"></span>${esc(label)}${step}</span>
+        <span class="phase p-${esc(phase)}"><span class="dot"></span>${esc(label)}${step}${reason}</span>
         <div class="msg">${esc(t.message || "")}</div>
       </td>
-      <td class="num">${t.workers} 节点 × ${t.gpusPerWorker} GPU${t.gpuType ? `<div class="sub">${esc(t.gpuType)}</div>` : ""}</td>
+      <td class="num">${t.workers} 节点 × ${t.gpusPerWorker} GPU<div class="sub">就绪 ${t.readyWorkers}/${t.workers}${gpuSub}</div></td>
       <td class="num right">run ${t.runId}<div class="sub">第 ${t.round} 轮</div></td>
       <td class="num right">${t.restartCount}/${t.maxRestarts}<div class="sub">抢占 ${t.preemptionCount}/${t.maxPreemptions}</div></td>
       <td class="hide-sm"><div class="chips">${nodes}${excluded}</div></td>
       <td class="num right">${duration(t.meteredSeconds)}
-        <div class="sub">${t.workers} 节点</div>
+        <div class="sub">${esc(meterSub)}</div>
       </td>
     </tr>`;
   }).join("");
+}
+
+for (const id of ["filter-ns", "filter-phase", "filter-q"]) {
+  document.getElementById(id).addEventListener("input", () => { if (lastData) render(lastData); });
 }
 
 async function refresh() {

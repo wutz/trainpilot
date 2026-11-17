@@ -9,6 +9,7 @@ spec:
     - echo "hello from node ${NODE_RANK}/${NNODES} (rank ${PET_NODE_RANK}), task ${TASK_ID} run ${RUN_ID} restart ${RESTART_COUNT}"
   workers: 2
   resources:
+    gpusPerWorker: 0
     cpu: "2"
     memory: 4Gi
   faultTolerance:

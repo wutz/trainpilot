@@ -26,9 +26,11 @@ import (
 	trainpilotv1alpha1 "github.com/wutz/trainpilot/api/v1alpha1"
 )
 
+const testTaskName = "nccl"
+
 func task(workers, gpus int32) *trainpilotv1alpha1.TrainTask {
 	return &trainpilotv1alpha1.TrainTask{
-		Name: "nccl", Namespace: "trainpilot",
+		Name: testTaskName, Namespace: "trainpilot",
 		Spec: trainpilotv1alpha1.TrainTaskSpec{
 			Image:   "example/nccl:latest",
 			Command: []string{"echo hello"},
@@ -52,7 +54,7 @@ func TestNamesStayWithinDNSLabel(t *testing.T) {
 	if !strings.HasSuffix(got, "-r12-34") {
 		t.Fatalf("name %q lost the run/round suffix", got)
 	}
-	if got := Names("nccl", Round{RunID: 1, Round: 1}); got != "nccl-r1-1" {
+	if got := Names(testTaskName, Round{RunID: 1, Round: 1}); got != "nccl-r1-1" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -291,4 +293,100 @@ func TestJobSetNeverRestartsOnItsOwn(t *testing.T) {
 		t.Fatal("the runtime must enable DNS hostnames for MASTER_ADDR")
 	}
 	_ = time.Second
+}
+
+func TestMultiNodeZeroGPUSkipsRDMA(t *testing.T) {
+	pod := WorkerPodSpec(task(2, 0), Round{RunID: 1, Round: 1}, Options{})
+	if pod.HostNetwork {
+		t.Fatal("2-worker CPU-only task must not enable hostNetwork / RDMA")
+	}
+	if _, ok := pod.Containers[0].Resources.Limits[RDMAKey]; ok {
+		t.Fatal("2-worker CPU-only task must not request rdma/hca")
+	}
+}
+
+func TestRDMAOverrideAndPodOptions(t *testing.T) {
+	tk := task(1, 0)
+	tk.Spec.RDMA = new(true)
+	port := int32(29600)
+	tk.Spec.MasterPort = &port
+	grace := int64(120)
+	tk.Spec.TerminationGracePeriodSeconds = &grace
+	tk.Spec.WorkingDir = "/workspace"
+	tk.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "regcred"}}
+	tk.Spec.EnvFrom = []corev1.EnvFromSource{{
+		ConfigMapRef: &corev1.ConfigMapEnvSource{Name: "train-env"},
+	}}
+
+	pod := WorkerPodSpec(tk, Round{RunID: 1, Round: 1}, Options{
+		RDMAResourceName: "nvidia.com/roce_gdr",
+		RDMAPerWorker:    2,
+	})
+	if !pod.HostNetwork {
+		t.Fatal("explicit spec.rdma=true must enable hostNetwork")
+	}
+	qty := pod.Containers[0].Resources.Limits["nvidia.com/roce_gdr"]
+	if qty.Value() != 2 {
+		t.Fatalf("custom RDMA quantity = %d, want 2", qty.Value())
+	}
+	if pod.TerminationGracePeriodSeconds == nil || *pod.TerminationGracePeriodSeconds != 120 {
+		t.Fatalf("terminationGracePeriodSeconds = %v, want 120", pod.TerminationGracePeriodSeconds)
+	}
+	if pod.Containers[0].WorkingDir != "/workspace" {
+		t.Fatalf("workingDir = %q", pod.Containers[0].WorkingDir)
+	}
+	if len(pod.ImagePullSecrets) != 1 || pod.ImagePullSecrets[0].Name != "regcred" {
+		t.Fatalf("imagePullSecrets = %+v", pod.ImagePullSecrets)
+	}
+	if len(pod.Containers[0].EnvFrom) != 1 || pod.Containers[0].EnvFrom[0].ConfigMapRef.Name != "train-env" {
+		t.Fatalf("envFrom = %+v", pod.Containers[0].EnvFrom)
+	}
+	var masterPort string
+	for _, e := range pod.Containers[0].Env {
+		if e.Name == "MASTER_PORT" {
+			masterPort = e.Value
+		}
+	}
+	if masterPort != "29600" {
+		t.Fatalf("MASTER_PORT = %q, want 29600", masterPort)
+	}
+
+	// Explicit false disables RDMA even for 2x8 GPU.
+	gpuTk := task(2, 8)
+	gpuTk.Spec.RDMA = new(false)
+	gpuPod := WorkerPodSpec(gpuTk, Round{RunID: 1, Round: 1}, Options{})
+	if gpuPod.HostNetwork {
+		t.Fatal("explicit spec.rdma=false must disable hostNetwork")
+	}
+	if _, ok := gpuPod.Containers[0].Resources.Limits[RDMAKey]; ok {
+		t.Fatal("explicit spec.rdma=false must omit RDMA resource")
+	}
+}
+
+func TestLongNamesIncludeHashToAvoidCollisions(t *testing.T) {
+	prefix := strings.Repeat("a", 55)
+	a := Names(prefix+"-alpha", Round{RunID: 1, Round: 1})
+	b := Names(prefix+"-bravo", Round{RunID: 1, Round: 1})
+	if len(a) > 63 || len(b) > 63 {
+		t.Fatalf("truncated names exceeded 63 chars: %d, %d", len(a), len(b))
+	}
+	if a == b {
+		t.Fatalf("long names collided: %q", a)
+	}
+}
+
+func TestAffinityRoundScopedAndOptionalGPUType(t *testing.T) {
+	tk := task(2, 8)
+	tk.Spec.GPUType = ""
+	pod := WorkerPodSpec(tk, Round{RunID: 3, Round: 4}, Options{GPULabel: GPULabel})
+	if pod.Affinity == nil || pod.Affinity.PodAntiAffinity == nil {
+		t.Fatal("expected PodAntiAffinity")
+	}
+	sel := pod.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0].LabelSelector.MatchLabels
+	if sel[InstanceLabel] != "nccl" || sel[RunIDLabel] != "3" || sel[RoundLabel] != "4" {
+		t.Fatalf("anti-affinity labels not round-scoped: %+v", sel)
+	}
+	if pod.Affinity.NodeAffinity != nil {
+		t.Fatalf("unexpected NodeAffinity when GPUType and ExcludedNodes are empty: %+v", pod.Affinity.NodeAffinity)
+	}
 }

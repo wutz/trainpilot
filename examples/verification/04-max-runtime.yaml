@@ -12,6 +12,7 @@ spec:
     - echo "start"; sleep 600
   workers: 1
   resources:
+    gpusPerWorker: 0
     cpu: "1"
     memory: 1Gi
   faultTolerance:

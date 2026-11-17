@@ -34,6 +34,7 @@ import (
 func TestManagerSchemeCoversWatchedTypes(t *testing.T) {
 	for _, obj := range []runtime.Object{
 		&corev1.Node{},
+		&corev1.Pod{},
 		&trainpilotv1alpha1.TrainTask{},
 		&trainerv1alpha1.TrainJob{},
 		&trainerv1alpha1.TrainingRuntime{},

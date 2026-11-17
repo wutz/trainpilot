@@ -51,6 +51,12 @@ spec:
             {{- if .Values.controller.defaultQueueName }}
             - --default-queue-name={{ .Values.controller.defaultQueueName }}
             {{- end }}
+            - --rdma-resource-name={{ .Values.controller.rdmaResourceName }}
+            - --rdma-per-worker={{ .Values.controller.rdmaPerWorker }}
+            - --default-master-port={{ .Values.controller.defaultMasterPort }}
+            {{- if ge (int .Values.controller.defaultTTLSecondsAfterFinished) 0 }}
+            - --default-ttl-seconds-after-finished={{ .Values.controller.defaultTTLSecondsAfterFinished }}
+            {{- end }}
             {{- if .Values.metrics.enabled }}
             - --metrics-bind-address=:{{ .Values.metrics.port }}
             - --metrics-secure={{ .Values.metrics.secure }}
@@ -138,4 +144,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      terminationGracePeriodSeconds: 10
+      terminationGracePeriodSeconds: 20
